@@ -1,0 +1,53 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tiles-to-mesh"
+version = "0.1.0"
+description = "Fetch Google 3D Tiles, build meshes, clean up with Blender, and preview in Jupyter/Colab"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["3d-tiles", "google-maps", "mesh", "blender", "jupyter", "colab"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Jupyter",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "numpy>=1.24",
+    "ipywidgets>=8.0",
+    "pythreejs>=2.4",
+    "tqdm>=4.60",
+    "requests>=2.28",
+    "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+blender = ["bpy>=4.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "maturin>=1.7",
+]
+colab = [
+    "google-colab",
+]
+all = [
+    "tiles-to-mesh[blender,dev]",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "tiles_to_mesh._tiles_to_mesh_rs"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
