@@ -336,47 +336,63 @@ def _fetch_mesh_python(
                 n_skipped += 1
                 continue
 
-            # ── Diagnostic: vertex range for first tile ───────────
-            if show_progress and not getattr(_fetch_mesh_python, '_verts_diag_done', False):
-                _fetch_mesh_python._verts_diag_done = True  # type: ignore[attr-defined]
-                vmin = verts.min(axis=0)
-                vmax = verts.max(axis=0)
-                print(f"    [diag] Raw parsed vertex range:")
-                print(f"    [diag]   min = ({vmin[0]:.4f}, {vmin[1]:.4f}, {vmin[2]:.4f})")
-                print(f"    [diag]   max = ({vmax[0]:.4f}, {vmax[1]:.4f}, {vmax[2]:.4f})")
-                mag = np.linalg.norm(verts.mean(axis=0))
-                print(f"    [diag]   mean magnitude = {mag:.1f}")
-                if mag > 1e6:
-                    print(f"    [diag]   ⚠ Vertices appear to be in ECEF already "
-                          f"(magnitude ~{mag:.0f} m)")
-
-            # ── Detect if trimesh already placed verts in ECEF ────
-            # If the mean vertex magnitude > 1 million metres, the GLB's
-            # internal node transform already placed them in ECEF space.
-            # Applying the tileset transform on top would double-place them.
             n = len(verts)
             vertex_mag = float(np.linalg.norm(verts.mean(axis=0)))
+
+            # ── Axis correction + ECEF detection ──────────────────
+            # Google's 3D Tiles GLBs include a Y-up→Z-up rotation
+            # (Rx(-90°)) in the glTF node matrix.  After the parser
+            # applies that matrix the output columns are:
+            #   (out_X, out_Y, out_Z) = (ECEF_X, ECEF_Z, -ECEF_Y)
+            # We apply Rx(+90°) to recover standard ECEF so the
+            # subsequent ENU conversion works correctly.
             if vertex_mag > 1e6:
-                # Already in ECEF — skip the tileset transform
+                ecef = np.empty_like(verts)
+                ecef[:, 0] = verts[:, 0]     # ECEF X  = out X
+                ecef[:, 1] = -verts[:, 2]    # ECEF Y  = -out Z
+                ecef[:, 2] = verts[:, 1]     # ECEF Z  = out Y
+                verts = ecef
+
+                if norms is not None and len(norms) == n:
+                    en = np.empty_like(norms)
+                    en[:, 0] = norms[:, 0]
+                    en[:, 1] = -norms[:, 2]
+                    en[:, 2] = norms[:, 1]
+                    norms = en
+
                 all_vertices.append(verts)
+                if norms is not None and len(norms) == n:
+                    all_normals.append(norms)
             else:
                 # In tile-local space — apply tileset transform to get ECEF
                 hom = np.ones((n, 4), dtype=np.float64)
                 hom[:, :3] = verts
                 transformed = (tile_transform @ hom.T).T[:, :3].astype(np.float32)
                 all_vertices.append(transformed)
-            # Normals are transformed by the upper-left 3×3 (no translation)
-            if norms is not None and len(norms) == n:
-                if vertex_mag <= 1e6:
-                    # Only transform normals if we also transformed vertices
+
+                if norms is not None and len(norms) == n:
                     rot = tile_transform[:3, :3]
                     tn = (rot @ norms.astype(np.float64).T).T.astype(np.float32)
                     lens = np.linalg.norm(tn, axis=1, keepdims=True)
                     lens[lens == 0] = 1.0
                     tn /= lens
                     all_normals.append(tn)
-                else:
-                    all_normals.append(norms)
+
+            # ── Diagnostic: vertex range for first tile ───────────
+            if show_progress and not getattr(_fetch_mesh_python, '_verts_diag_done', False):
+                _fetch_mesh_python._verts_diag_done = True  # type: ignore[attr-defined]
+                vmin = verts.min(axis=0)
+                vmax = verts.max(axis=0)
+                vmean = verts.mean(axis=0)
+                print(f"    [diag] Vertex range (after axis fix):")
+                print(f"    [diag]   min = ({vmin[0]:.1f}, {vmin[1]:.1f}, {vmin[2]:.1f})")
+                print(f"    [diag]   max = ({vmax[0]:.1f}, {vmax[1]:.1f}, {vmax[2]:.1f})")
+                # Show the implied lat/lng to verify correctness
+                import math as _math
+                _lng = _math.degrees(_math.atan2(vmean[1], vmean[0]))
+                _hyp = _math.sqrt(float(vmean[0])**2 + float(vmean[1])**2)
+                _lat = _math.degrees(_math.atan2(vmean[2], _hyp))
+                print(f"    [diag]   implied lat/lng = ({_lat:.4f}, {_lng:.4f})")
 
             if uvs is not None and len(uvs) == n:
                 all_texcoords.append(uvs)
