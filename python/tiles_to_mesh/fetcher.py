@@ -761,6 +761,65 @@ def _fetch_child_tileset(
         return None
 
 
+_draco_warned = False
+
+
+def _decode_draco_primitive(
+    draco_ext: Dict,
+    buffer_views: List[Dict],
+    bin_data: bytes,
+) -> Optional[Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]]:
+    """Attempt to decode a Draco-compressed glTF primitive.
+
+    Returns (positions, normals, texcoords, indices) or None.
+    Requires the ``DracoPy`` package (``pip install DracoPy``).
+    """
+    global _draco_warned
+
+    try:
+        import DracoPy  # type: ignore
+    except ImportError:
+        if not _draco_warned:
+            import warnings
+            warnings.warn(
+                "This tileset uses Draco mesh compression but DracoPy is not "
+                "installed.  Run  pip install DracoPy  for proper mesh decoding.",
+                stacklevel=4,
+            )
+            _draco_warned = True
+        return None
+
+    bv_index = draco_ext.get("bufferView")
+    if bv_index is None:
+        return None
+
+    bv = buffer_views[bv_index]
+    bv_offset = bv.get("byteOffset", 0)
+    bv_length = bv["byteLength"]
+    compressed = bytes(bin_data[bv_offset : bv_offset + bv_length])
+
+    try:
+        mesh_obj = DracoPy.decode(compressed)
+    except Exception:
+        return None
+
+    positions = np.array(mesh_obj.points, dtype=np.float32).reshape(-1, 3)
+
+    normals = None
+    if hasattr(mesh_obj, "normals") and mesh_obj.normals is not None and len(mesh_obj.normals):
+        normals = np.array(mesh_obj.normals, dtype=np.float32).reshape(-1, 3)
+
+    texcoords = None
+    if hasattr(mesh_obj, "tex_coord") and mesh_obj.tex_coord is not None and len(mesh_obj.tex_coord):
+        texcoords = np.array(mesh_obj.tex_coord, dtype=np.float32).reshape(-1, 2)
+
+    indices = None
+    if hasattr(mesh_obj, "faces") and mesh_obj.faces is not None and len(mesh_obj.faces):
+        indices = np.array(mesh_obj.faces, dtype=np.uint32).reshape(-1, 3)
+
+    return positions, normals, texcoords, indices
+
+
 def _triangle_strip_to_triangles(indices: np.ndarray) -> np.ndarray:
     """Convert a TRIANGLE_STRIP index array to plain TRIANGLES."""
     if len(indices) < 3:
@@ -836,9 +895,35 @@ def _parse_glb_python(data: bytes):
     all_indices = []
     base_vertex = 0
 
+    # Check for Draco compression
+    extensions_used = json_chunk.get("extensionsUsed", [])
+    has_draco = "KHR_draco_mesh_compression" in extensions_used
+
     for mesh in meshes:
         for primitive in mesh.get("primitives", []):
             attrs = primitive.get("attributes", {})
+
+            # ── If this primitive uses Draco compression, try to decode it ──
+            draco_ext = primitive.get("extensions", {}).get(
+                "KHR_draco_mesh_compression"
+            )
+            if draco_ext:
+                draco_result = _decode_draco_primitive(
+                    draco_ext, buffer_views, bin_chunk
+                )
+                if draco_result is not None:
+                    d_pos, d_norm, d_uv, d_idx = draco_result
+                    all_positions.append(d_pos)
+                    if d_norm is not None:
+                        all_normals.append(d_norm)
+                    if d_uv is not None:
+                        all_texcoords.append(d_uv)
+                    if d_idx is not None:
+                        all_indices.append(d_idx + base_vertex)
+                    base_vertex += len(d_pos)
+                    continue  # Don't also read the fallback accessors
+                # If Draco decode failed, fall through to regular accessors
+                # (they may contain quantized fallback data)
 
             # Positions
             if "POSITION" in attrs:
@@ -922,20 +1007,54 @@ def _parse_glb_python(data: bytes):
 
 
 def _read_accessor(accessor: Dict, buffer_views: List[Dict], bin_data: bytes) -> Optional[bytes]:
-    """Read raw bytes for a glTF accessor."""
+    """Read raw bytes for a glTF accessor, respecting byteStride.
+
+    Google's 3D Tiles frequently use **interleaved** buffer views where
+    positions, normals, and UVs share a single buffer view with a stride.
+    Without handling ``byteStride`` we'd read the wrong bytes for every
+    attribute.
+    """
     bv_index = accessor.get("bufferView")
     if bv_index is None:
         return None
 
     bv = buffer_views[bv_index]
     bv_offset = bv.get("byteOffset", 0)
-    bv_length = bv["byteLength"]
     acc_offset = accessor.get("byteOffset", 0)
-
-    start = bv_offset + acc_offset
-    end = bv_offset + bv_length
-
-    if end > len(bin_data):
+    count = accessor.get("count", 0)
+    if count == 0:
         return None
 
-    return bytes(bin_data[start:end])
+    # Component size in bytes
+    comp_type = accessor.get("componentType", 5126)
+    _COMP_SIZES = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
+    comp_size = _COMP_SIZES.get(comp_type, 4)
+
+    # Number of components per element
+    _TYPE_COUNTS = {
+        "SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4,
+        "MAT2": 4, "MAT3": 9, "MAT4": 16,
+    }
+    type_count = _TYPE_COUNTS.get(accessor.get("type", "SCALAR"), 1)
+
+    element_size = comp_size * type_count
+    byte_stride = bv.get("byteStride", 0)
+
+    start = bv_offset + acc_offset
+
+    if byte_stride and byte_stride > element_size:
+        # Interleaved — extract each element from the strided layout
+        out = bytearray(count * element_size)
+        for i in range(count):
+            src = start + i * byte_stride
+            dst = i * element_size
+            if src + element_size > len(bin_data):
+                break
+            out[dst:dst + element_size] = bin_data[src:src + element_size]
+        return bytes(out)
+    else:
+        # Tightly packed — read a contiguous block
+        end = start + count * element_size
+        if end > len(bin_data):
+            return None
+        return bytes(bin_data[start:end])
