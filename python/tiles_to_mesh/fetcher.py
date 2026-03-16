@@ -26,9 +26,11 @@ try:
     import trimesh as _trimesh
 
     HAS_TRIMESH = True
-except ImportError:
+except Exception as _trimesh_err:
     _trimesh = None  # type: ignore[assignment]
     HAS_TRIMESH = False
+    # Store the error so we can report it once if the user has progress on
+    _TRIMESH_IMPORT_ERROR = _trimesh_err
 
 # Try importing the Rust extension; fall back to pure-Python if not available
 try:
@@ -285,6 +287,12 @@ def _fetch_mesh_python(
     parser = "trimesh" if HAS_TRIMESH else "builtin"
     if show_progress:
         print(f"  GLB parser: {parser}")
+        if not HAS_TRIMESH:
+            err = globals().get("_TRIMESH_IMPORT_ERROR")
+            if err:
+                print(f"  ⚠ trimesh import failed: {err}")
+            else:
+                print(f"  ⚠ trimesh not installed — using builtin GLB parser")
 
     iterator = tqdm(tile_entries, desc="Downloading GLBs", unit="tile") if show_progress else tile_entries
 
@@ -329,7 +337,7 @@ def _fetch_mesh_python(
                 continue
 
             # ── Diagnostic: vertex range for first tile ───────────
-            if show_progress and not hasattr(_fetch_mesh_python, '_verts_diag_done'):
+            if show_progress and not getattr(_fetch_mesh_python, '_verts_diag_done', False):
                 _fetch_mesh_python._verts_diag_done = True  # type: ignore[attr-defined]
                 vmin = verts.min(axis=0)
                 vmax = verts.max(axis=0)
@@ -346,13 +354,13 @@ def _fetch_mesh_python(
             # If the mean vertex magnitude > 1 million metres, the GLB's
             # internal node transform already placed them in ECEF space.
             # Applying the tileset transform on top would double-place them.
+            n = len(verts)
             vertex_mag = float(np.linalg.norm(verts.mean(axis=0)))
             if vertex_mag > 1e6:
                 # Already in ECEF — skip the tileset transform
                 all_vertices.append(verts)
             else:
                 # In tile-local space — apply tileset transform to get ECEF
-                n = len(verts)
                 hom = np.ones((n, 4), dtype=np.float64)
                 hom[:, :3] = verts
                 transformed = (tile_transform @ hom.T).T[:, :3].astype(np.float32)
