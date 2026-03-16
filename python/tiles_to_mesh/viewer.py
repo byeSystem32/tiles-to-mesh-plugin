@@ -3,13 +3,22 @@ Interactive Three.js mesh viewer for Jupyter/Colab notebooks.
 
 Uses pythreejs to render a 3D preview of the mesh with orbit controls,
 lighting, wireframe toggle, and texture display.
+
+In Google Colab the pythreejs widget-sync layer has trait incompatibilities
+(shadow, target, etc.) so we fall back to a pure-HTML Three.js viewer that
+avoids the widget layer entirely.
 """
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Optional, Tuple
 
 import numpy as np
+
+
+def _is_colab() -> bool:
+    return "google.colab" in sys.modules
 
 
 class MeshViewer:
@@ -52,6 +61,10 @@ class MeshViewer:
         Returns:
             The renderer widget (for display in notebooks).
         """
+        # In Colab, pythreejs widget-sync triggers TraitErrors on light
+        # shadow/target traits.  Use the pure-HTML renderer instead.
+        if _is_colab():
+            return self._show_html_fallback()
         try:
             return self._show_pythreejs()
         except ImportError:
@@ -273,9 +286,16 @@ class MeshViewer:
         return lights
 
     def _show_html_fallback(self) -> Any:
-        """Fallback viewer using raw Three.js via HTML when pythreejs is not available."""
+        """Viewer using raw Three.js via HTML.
+
+        Works everywhere (Colab, Jupyter, JupyterLab) because it doesn't
+        rely on the pythreejs widget-sync layer.  Uses an ES-module import
+        of Three.js from a CDN so there are no global-scope collisions.
+        """
         from IPython.display import display, HTML
         import json
+        import base64
+        import uuid
 
         mesh = self.mesh
         bounds = mesh.bounds
@@ -286,40 +306,60 @@ class MeshViewer:
         vertices_list = mesh.vertices.flatten().tolist()
         faces_list = mesh.faces.flatten().tolist()
 
+        normals_js = "null"
+        if mesh.has_normals:
+            normals_js = json.dumps(mesh.normals.flatten().tolist())
+
+        viewer_id = f"ttm-viewer-{uuid.uuid4().hex[:8]}"
+
         html = f"""
-        <div id="ttm-viewer" style="width: {self.width}px; height: {self.height}px;"></div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-        <script>
+        <div id="{viewer_id}" style="width:{self.width}px;height:{self.height}px;position:relative;border:1px solid #333;border-radius:4px;overflow:hidden;"></div>
+        <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+        import {{ OrbitControls }} from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
         (function() {{
-            var container = document.getElementById('ttm-viewer');
-            var scene = new THREE.Scene();
+            const container = document.getElementById('{viewer_id}');
+            if (!container) return;
+
+            const scene = new THREE.Scene();
             scene.background = new THREE.Color('{self.background}');
 
-            var camera = new THREE.PerspectiveCamera(50, {self.width}/{self.height}, 0.1, {max_dim * 100});
+            const W = {self.width}, H = {self.height};
+            const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, {max_dim * 100});
             camera.position.set(
                 {center[0] + max_dim * 0.5},
                 {center[1] + max_dim * 0.7},
                 {center[2] + max_dim * 0.5}
             );
 
-            var renderer = new THREE.WebGLRenderer({{ antialias: true }});
-            renderer.setSize({self.width}, {self.height});
+            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(W, H);
+            renderer.setPixelRatio(window.devicePixelRatio || 1);
             container.appendChild(renderer.domElement);
 
-            var controls = new THREE.OrbitControls(camera, renderer.domElement);
+            const controls = new OrbitControls(camera, renderer.domElement);
             controls.target.set({center[0]}, {center[1]}, {center[2]});
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.12;
             controls.update();
 
-            // Build geometry
-            var geometry = new THREE.BufferGeometry();
-            var vertices = new Float32Array({json.dumps(vertices_list)});
+            // ── Geometry ──────────────────────────────────────────────
+            const geometry = new THREE.BufferGeometry();
+            const vertices = new Float32Array({json.dumps(vertices_list)});
             geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
-            var indices = new Uint32Array({json.dumps(faces_list)});
-            geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-            geometry.computeVertexNormals();
 
-            var material = new THREE.MeshStandardMaterial({{
+            const indices = new Uint32Array({json.dumps(faces_list)});
+            geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+
+            const normData = {normals_js};
+            if (normData) {{
+                geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normData), 3));
+            }} else {{
+                geometry.computeVertexNormals();
+            }}
+
+            const material = new THREE.MeshStandardMaterial({{
                 color: 0x8fa8c8,
                 wireframe: {'true' if self.wireframe else 'false'},
                 side: THREE.DoubleSide,
@@ -327,15 +367,27 @@ class MeshViewer:
                 roughness: 0.7
             }});
 
-            var mesh = new THREE.Mesh(geometry, material);
+            const mesh = new THREE.Mesh(geometry, material);
             scene.add(mesh);
 
-            // Lighting
-            scene.add(new THREE.AmbientLight(0x404040, 0.5));
-            var dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight.position.set({max_dim * 2}, {max_dim * 3}, {max_dim});
-            scene.add(dirLight);
+            // ── Lighting ──────────────────────────────────────────────
+            scene.add(new THREE.AmbientLight(0x404040, 0.6));
+            const d1 = new THREE.DirectionalLight(0xffffff, 0.9);
+            d1.position.set({max_dim * 2}, {max_dim * 3}, {max_dim});
+            scene.add(d1);
+            const d2 = new THREE.DirectionalLight(0xffffff, 0.3);
+            d2.position.set(-{max_dim}, {max_dim * 2}, -{max_dim});
+            scene.add(d2);
 
+            // ── Info bar ──────────────────────────────────────────────
+            const info = document.createElement('div');
+            info.style.cssText = 'position:absolute;bottom:0;left:0;right:0;padding:4px 8px;'
+                + 'background:rgba(0,0,0,0.6);color:#eee;font:12px monospace;';
+            info.textContent = 'Vertices: {mesh.vertex_count:,} | Faces: {mesh.face_count:,}'
+                + ' | Drag to rotate, scroll to zoom';
+            container.appendChild(info);
+
+            // ── Render loop ───────────────────────────────────────────
             function animate() {{
                 requestAnimationFrame(animate);
                 controls.update();

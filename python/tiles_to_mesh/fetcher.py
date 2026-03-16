@@ -761,6 +761,30 @@ def _fetch_child_tileset(
         return None
 
 
+def _triangle_strip_to_triangles(indices: np.ndarray) -> np.ndarray:
+    """Convert a TRIANGLE_STRIP index array to plain TRIANGLES."""
+    if len(indices) < 3:
+        return np.empty(0, dtype=np.uint32)
+    tris = []
+    for i in range(len(indices) - 2):
+        if i % 2 == 0:
+            tris.extend([indices[i], indices[i + 1], indices[i + 2]])
+        else:
+            # Reverse winding for odd triangles
+            tris.extend([indices[i + 1], indices[i], indices[i + 2]])
+    return np.array(tris, dtype=np.uint32)
+
+
+def _triangle_fan_to_triangles(indices: np.ndarray) -> np.ndarray:
+    """Convert a TRIANGLE_FAN index array to plain TRIANGLES."""
+    if len(indices) < 3:
+        return np.empty(0, dtype=np.uint32)
+    tris = []
+    for i in range(1, len(indices) - 1):
+        tris.extend([indices[0], indices[i], indices[i + 1]])
+    return np.array(tris, dtype=np.uint32)
+
+
 def _parse_glb_python(data: bytes):
     """Parse a GLB file in pure Python. Returns (vertices, normals, texcoords, indices, texture) or None."""
     if len(data) < 12:
@@ -849,7 +873,25 @@ def _parse_glb_python(data: bytes):
                         idxs = np.frombuffer(idx_data, dtype=np.uint16).astype(np.uint32)
                     else:  # UNSIGNED_INT
                         idxs = np.frombuffer(idx_data, dtype=np.uint32)
-                    all_indices.append(idxs.reshape(-1, 3) + base_vertex)
+
+                    prim_mode = primitive.get("mode", 4)  # default = TRIANGLES
+
+                    if prim_mode == 5:
+                        # TRIANGLE_STRIP → convert to individual triangles
+                        idxs = _triangle_strip_to_triangles(idxs)
+                    elif prim_mode == 6:
+                        # TRIANGLE_FAN → convert to individual triangles
+                        idxs = _triangle_fan_to_triangles(idxs)
+                    elif prim_mode != 4:
+                        # Not a triangle-based primitive — skip
+                        continue
+
+                    if len(idxs) >= 3 and len(idxs) % 3 == 0:
+                        all_indices.append(idxs.reshape(-1, 3) + base_vertex)
+                    elif len(idxs) >= 3:
+                        # Truncate to nearest multiple of 3 (safety net)
+                        trim = len(idxs) - (len(idxs) % 3)
+                        all_indices.append(idxs[:trim].reshape(-1, 3) + base_vertex)
 
             if all_positions:
                 base_vertex += len(all_positions[-1])
