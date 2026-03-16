@@ -210,6 +210,16 @@ def _fetch_mesh_python(
     resp.raise_for_status()
     root_tileset = resp.json()
 
+    # Extract the session token from the root tileset.  Google embeds it
+    # in child URIs (e.g. "...json?session=TOKEN").  ALL subsequent tile
+    # requests require this token or they fail with 400 Bad Request.
+    session_token = _extract_session_token(root_tileset)
+    if show_progress:
+        if session_token:
+            print(f"  Session token: {session_token[:12]}…")
+        else:
+            print("  ⚠ No session token found in root tileset")
+
     # Step 2: Walk the tileset tree — recursively fetching child tileset
     #         JSON files — until we reach leaf nodes with GLB content.
     target_error = LOD_THRESHOLDS.get(lod, 30.0)
@@ -224,6 +234,7 @@ def _fetch_mesh_python(
         aabb=polygon_aabb,
         target_error=target_error,
         api_key=api_key,
+        session_token=session_token,
         http=http,
         stats=stats,
     )
@@ -333,17 +344,59 @@ def _compute_aabb(polygon: List[Tuple[float, float]]) -> Tuple[float, float, flo
     return (min(lats), max(lats), min(lngs), max(lngs))
 
 
-def _resolve_uri(uri: str, api_key: str) -> str:
-    """Turn a tileset URI (absolute, root-relative, or relative) into a full URL."""
+def _extract_session_token(root_tileset: Dict) -> Optional[str]:
+    """Extract the session token from child URIs in the root tileset.
+
+    Google embeds ``?session=TOKEN`` in the content URIs of the root
+    tileset's children.  We need this token for all subsequent requests.
+    """
+    from urllib.parse import urlparse, parse_qs
+
+    def _search_node(node: Dict) -> Optional[str]:
+        # Check this node's content URI
+        content = node.get("content", {})
+        uri = content.get("uri", content.get("url", ""))
+        if uri and "session=" in uri:
+            parsed = parse_qs(urlparse(uri).query if "://" in uri else uri.split("?", 1)[-1])
+            tokens = parsed.get("session", [])
+            if tokens:
+                return tokens[0]
+        # Check children
+        for child in node.get("children", []):
+            token = _search_node(child)
+            if token:
+                return token
+        return None
+
+    root_node = root_tileset.get("root", root_tileset)
+    return _search_node(root_node)
+
+
+def _resolve_uri(uri: str, api_key: str, session_token: Optional[str] = None) -> str:
+    """Turn a tileset URI into a full URL with key and session params."""
+    # Build the base URL
     if uri.startswith("http"):
-        sep = "&" if "?" in uri else "?"
-        return f"{uri}{sep}key={api_key}"
+        url = uri
     elif uri.startswith("/"):
-        sep = "&" if "?" in uri else "?"
-        return f"{_BASE_HOST}{uri}{sep}key={api_key}"
+        url = f"{_BASE_HOST}{uri}"
     else:
-        sep = "&" if "?" in uri else "?"
-        return f"{TILES_API_BASE}/{uri}{sep}key={api_key}"
+        url = f"{TILES_API_BASE}/{uri}"
+
+    # Ensure the URL has both key= and session= parameters
+    has_key = "key=" in url
+    has_session = "session=" in url
+
+    params_to_add = []
+    if not has_key:
+        params_to_add.append(f"key={api_key}")
+    if not has_session and session_token:
+        params_to_add.append(f"session={session_token}")
+
+    if params_to_add:
+        sep = "&" if "?" in url else "?"
+        url = url + sep + "&".join(params_to_add)
+
+    return url
 
 
 def _node_intersects_aabb(node: Dict, aabb: Tuple[float, float, float, float]) -> bool:
@@ -411,6 +464,7 @@ def _collect_glb_urls(
     aabb: Tuple[float, float, float, float],
     target_error: float,
     api_key: str,
+    session_token: Optional[str],
     http: requests.Session,
     stats: _TraversalStats,
     _depth: int = 0,
@@ -446,18 +500,18 @@ def _collect_glb_urls(
         urls: List[str] = []
         for child in children:
             urls.extend(
-                _collect_glb_urls(child, aabb, target_error, api_key, http, stats, _depth + 1)
+                _collect_glb_urls(child, aabb, target_error, api_key, session_token, http, stats, _depth + 1)
             )
         return urls
 
     # If we want to refine but have NO inline children, the content URI
     # may point to a child tileset JSON — fetch and traverse it.
     if want_refine and content_uri and _looks_like_json_uri(content_uri):
-        child_tileset = _fetch_child_tileset(content_uri, api_key, http, stats)
+        child_tileset = _fetch_child_tileset(content_uri, api_key, session_token, http, stats)
         if child_tileset is not None:
             child_root = child_tileset.get("root", child_tileset)
             return _collect_glb_urls(
-                child_root, aabb, target_error, api_key, http, stats, _depth + 1
+                child_root, aabb, target_error, api_key, session_token, http, stats, _depth + 1
             )
         return []
 
@@ -466,16 +520,16 @@ def _collect_glb_urls(
         if _looks_like_json_uri(content_uri):
             # It's a JSON tileset — fetch and traverse it even though we've
             # reached the LOD threshold (the actual GLB is one level deeper).
-            child_tileset = _fetch_child_tileset(content_uri, api_key, http, stats)
+            child_tileset = _fetch_child_tileset(content_uri, api_key, session_token, http, stats)
             if child_tileset is not None:
                 child_root = child_tileset.get("root", child_tileset)
                 return _collect_glb_urls(
-                    child_root, aabb, target_error, api_key, http, stats, _depth + 1
+                    child_root, aabb, target_error, api_key, session_token, http, stats, _depth + 1
                 )
             return []
         else:
             stats.glb_found += 1
-            return [_resolve_uri(content_uri, api_key)]
+            return [_resolve_uri(content_uri, api_key, session_token)]
 
     return []
 
@@ -489,11 +543,12 @@ def _looks_like_json_uri(uri: str) -> bool:
 def _fetch_child_tileset(
     uri: str,
     api_key: str,
+    session_token: Optional[str],
     http: requests.Session,
     stats: _TraversalStats,
 ) -> Optional[Dict]:
     """Fetch a child tileset JSON, returning the parsed dict or None."""
-    url = _resolve_uri(uri, api_key)
+    url = _resolve_uri(uri, api_key, session_token)
     stats.json_fetched += 1
     try:
         resp = http.get(url, timeout=30)
@@ -502,7 +557,6 @@ def _fetch_child_tileset(
     except Exception as e:
         stats.json_failed += 1
         if len(stats.json_errors) < 5:
-            # Mask API key in error messages
             err_str = str(e)
             if api_key in err_str:
                 err_str = err_str.replace(api_key, "***")
