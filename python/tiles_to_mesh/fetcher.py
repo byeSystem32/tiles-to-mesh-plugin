@@ -20,6 +20,16 @@ from tqdm.auto import tqdm
 from tiles_to_mesh.selector import Region
 from tiles_to_mesh.mesh import Mesh
 
+# Optional: trimesh handles GLB loading far more robustly than our custom
+# parser (Draco decompression, interleaved buffers, glTF scene graph…).
+try:
+    import trimesh as _trimesh
+
+    HAS_TRIMESH = True
+except ImportError:
+    _trimesh = None  # type: ignore[assignment]
+    HAS_TRIMESH = False
+
 # Try importing the Rust extension; fall back to pure-Python if not available
 try:
     from tiles_to_mesh._tiles_to_mesh_rs import tiles as _rs_tiles
@@ -260,13 +270,19 @@ def _fetch_mesh_python(
         print(f"  Example URL: {debug_url}")
 
     # Step 3: Download GLBs, parse them, and apply tile transforms
-    all_vertices = []
-    all_normals = []
-    all_texcoords = []
-    all_indices = []
-    all_textures = []
+    all_vertices: List[np.ndarray] = []
+    all_normals: List[np.ndarray] = []
+    all_texcoords: List[np.ndarray] = []
+    all_indices: List[np.ndarray] = []
+    all_textures: list = []
     vertex_offset = 0
     n_skipped = 0
+    n_parse_err = 0
+    _first_tile_diagnosed = False
+
+    parser = "trimesh" if HAS_TRIMESH else "builtin"
+    if show_progress:
+        print(f"  GLB parser: {parser}")
 
     iterator = tqdm(tile_entries, desc="Downloading GLBs", unit="tile") if show_progress else tile_entries
 
@@ -276,14 +292,31 @@ def _fetch_mesh_python(
             tile_resp.raise_for_status()
             glb_data = tile_resp.content
 
-            mesh_data = _parse_glb_python(glb_data)
-            if mesh_data is None:
+            # ── Diagnostic dump for the very first tile ───────────
+            if show_progress and not _first_tile_diagnosed:
+                _first_tile_diagnosed = True
+                _dump_glb_info(glb_data)
+
+            # ── Parse the GLB ─────────────────────────────────────
+            if HAS_TRIMESH:
+                parse_result = _parse_glb_with_trimesh(glb_data)
+            else:
+                parse_result = _parse_glb_python(glb_data)
+
+            if parse_result is None:
                 n_skipped += 1
                 continue
 
-            verts, norms, uvs, idxs, tex = mesh_data
+            verts, norms, uvs, idxs, tex = parse_result
 
-            # ── Apply the tile's accumulated transform ────────────────
+            if verts is None or len(verts) == 0:
+                n_skipped += 1
+                continue
+            if idxs is None or len(idxs) == 0:
+                n_skipped += 1
+                continue
+
+            # ── Apply the tile's accumulated transform ────────────
             # verts is Nx3.  Extend to homogeneous Nx4, multiply, drop w.
             n = len(verts)
             hom = np.ones((n, 4), dtype=np.float64)
@@ -291,17 +324,16 @@ def _fetch_mesh_python(
             transformed = (tile_transform @ hom.T).T[:, :3].astype(np.float32)
             all_vertices.append(transformed)
 
-            # Normals are transformed by the upper-left 3x3 (no translation)
-            if norms is not None:
+            # Normals are transformed by the upper-left 3×3 (no translation)
+            if norms is not None and len(norms) == n:
                 rot = tile_transform[:3, :3]
-                transformed_norms = (rot @ norms.astype(np.float64).T).T.astype(np.float32)
-                # Re-normalise
-                lens = np.linalg.norm(transformed_norms, axis=1, keepdims=True)
+                tn = (rot @ norms.astype(np.float64).T).T.astype(np.float32)
+                lens = np.linalg.norm(tn, axis=1, keepdims=True)
                 lens[lens == 0] = 1.0
-                transformed_norms /= lens
-                all_normals.append(transformed_norms)
+                tn /= lens
+                all_normals.append(tn)
 
-            if uvs is not None:
+            if uvs is not None and len(uvs) == n:
                 all_texcoords.append(uvs)
 
             # Offset indices
@@ -312,12 +344,15 @@ def _fetch_mesh_python(
                 all_textures.append(tex)
 
         except Exception as e:
-            if show_progress:
-                print(f"  Warning: Failed to fetch tile: {e}")
+            n_parse_err += 1
+            if show_progress and n_parse_err <= 5:
+                print(f"  Warning: tile error: {e}")
             continue
 
     if show_progress and n_skipped:
         print(f"  ({n_skipped} tiles had no parseable mesh data)")
+    if show_progress and n_parse_err:
+        print(f"  ({n_parse_err} tiles failed to download/parse)")
 
     if not all_vertices:
         raise RuntimeError(
@@ -761,6 +796,155 @@ def _fetch_child_tileset(
         return None
 
 
+# ── trimesh-based GLB parser ──────────────────────────────────────────
+
+
+def _parse_glb_with_trimesh(data: bytes):
+    """Parse a GLB using trimesh.  Handles Draco, interleaved buffers,
+    glTF node transforms, and all accessor types correctly.
+
+    Returns the same 5-tuple as ``_parse_glb_python``:
+        (vertices, normals, texcoords, indices, texture)
+    or None on failure.
+    """
+    try:
+        result = _trimesh.load(
+            io.BytesIO(data),
+            file_type="glb",
+            force="scene",      # always get a Scene so we apply node xforms
+            process=False,       # don't merge / heal; we do that later
+        )
+    except Exception:
+        # If trimesh can't load it, fall back to the builtin parser
+        return _parse_glb_python(data)
+
+    if isinstance(result, _trimesh.Scene):
+        if len(result.geometry) == 0:
+            return _parse_glb_python(data)
+        try:
+            combined = result.dump(concatenate=True)
+        except Exception:
+            return _parse_glb_python(data)
+    elif isinstance(result, _trimesh.Trimesh):
+        combined = result
+    else:
+        return _parse_glb_python(data)
+
+    if combined is None or len(combined.vertices) == 0 or len(combined.faces) == 0:
+        return _parse_glb_python(data)
+
+    vertices = np.asarray(combined.vertices, dtype=np.float32)
+    faces = np.asarray(combined.faces, dtype=np.uint32)
+
+    normals = None
+    try:
+        vn = combined.vertex_normals
+        if vn is not None and len(vn) == len(vertices):
+            normals = np.asarray(vn, dtype=np.float32)
+    except Exception:
+        pass
+
+    texcoords = None
+    try:
+        vis = combined.visual
+        if hasattr(vis, "uv") and vis.uv is not None and len(vis.uv) == len(vertices):
+            texcoords = np.asarray(vis.uv, dtype=np.float32)
+    except Exception:
+        pass
+
+    # Texture image
+    texture = None
+    try:
+        vis = combined.visual
+        if hasattr(vis, "material") and hasattr(vis.material, "image"):
+            img = vis.material.image
+            if img is not None:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG")
+                texture = {"data": buf.getvalue(), "mime": "image/jpeg"}
+    except Exception:
+        pass
+
+    return vertices, normals, texcoords, faces, texture
+
+
+def _dump_glb_info(data: bytes) -> None:
+    """Print diagnostic information about a GLB file (first tile only)."""
+    try:
+        if len(data) < 12:
+            print("    [diag] GLB too short")
+            return
+
+        magic = struct.unpack_from("<I", data, 0)[0]
+        if magic != 0x46546C67:
+            print(f"    [diag] Not a GLB (magic=0x{magic:08X})")
+            return
+
+        # Parse JSON chunk
+        offset = 12
+        json_chunk = None
+        bin_size = 0
+        while offset < len(data):
+            if offset + 8 > len(data):
+                break
+            chunk_length = struct.unpack_from("<I", data, offset)[0]
+            chunk_type = struct.unpack_from("<I", data, offset + 4)[0]
+            if chunk_type == 0x4E4F534A:
+                json_chunk = json.loads(data[offset + 8: offset + 8 + chunk_length])
+            elif chunk_type == 0x004E4942:
+                bin_size = chunk_length
+            offset += 8 + chunk_length
+            offset = (offset + 3) & ~3
+
+        if json_chunk is None:
+            print("    [diag] No JSON chunk found")
+            return
+
+        exts = json_chunk.get("extensionsUsed", [])
+        exts_req = json_chunk.get("extensionsRequired", [])
+        meshes = json_chunk.get("meshes", [])
+        nodes = json_chunk.get("nodes", [])
+        scenes = json_chunk.get("scenes", [])
+        accessors = json_chunk.get("accessors", [])
+        bvs = json_chunk.get("bufferViews", [])
+
+        n_prims = sum(len(m.get("primitives", [])) for m in meshes)
+        has_draco = any("KHR_draco_mesh_compression" in
+                        p.get("extensions", {})
+                        for m in meshes
+                        for p in m.get("primitives", []))
+        has_stride = any(bv.get("byteStride", 0) > 0 for bv in bvs)
+        node_has_xform = sum(1 for n in nodes if "matrix" in n or "rotation" in n or "translation" in n)
+
+        print(f"    [diag] GLB: {len(data)} bytes, BIN chunk: {bin_size} bytes")
+        print(f"    [diag] extensionsUsed: {exts}")
+        print(f"    [diag] extensionsRequired: {exts_req}")
+        print(f"    [diag] scenes: {len(scenes)}, nodes: {len(nodes)} "
+              f"({node_has_xform} with transforms), meshes: {len(meshes)}, "
+              f"primitives: {n_prims}")
+        print(f"    [diag] accessors: {len(accessors)}, bufferViews: {len(bvs)}, "
+              f"interleaved (byteStride>0): {has_stride}")
+        print(f"    [diag] Draco compressed primitives: {has_draco}")
+
+        # Show first mesh's first primitive details
+        if meshes and meshes[0].get("primitives"):
+            prim = meshes[0]["primitives"][0]
+            attrs = prim.get("attributes", {})
+            print(f"    [diag] First primitive attributes: {list(attrs.keys())}")
+            print(f"    [diag]   mode: {prim.get('mode', 4)} (4=TRIANGLES)")
+            if "POSITION" in attrs:
+                pa = accessors[attrs["POSITION"]]
+                print(f"    [diag]   POSITION: count={pa.get('count')}, "
+                      f"type={pa.get('type')}, componentType={pa.get('componentType')}, "
+                      f"bufferView={pa.get('bufferView')}")
+            draco = prim.get("extensions", {}).get("KHR_draco_mesh_compression")
+            if draco:
+                print(f"    [diag]   Draco ext: bufferView={draco.get('bufferView')}, "
+                      f"attrs={draco.get('attributes')}")
+    except Exception as e:
+        print(f"    [diag] Error inspecting GLB: {e}")
+
+
 _draco_warned = False
 
 
@@ -818,6 +1002,112 @@ def _decode_draco_primitive(
         indices = np.array(mesh_obj.faces, dtype=np.uint32).reshape(-1, 3)
 
     return positions, normals, texcoords, indices
+
+
+def _compute_gltf_node_transforms(gltf_json: Dict) -> Dict[int, np.ndarray]:
+    """Compute world-space transforms for each *mesh index* in a glTF.
+
+    Walks the scene graph (``scenes`` → ``nodes``) and accumulates
+    transforms down to nodes that reference a mesh.  Returns a dict
+    mapping mesh-index → 4×4 world transform (float64).
+    """
+    nodes = gltf_json.get("nodes", [])
+    scenes = gltf_json.get("scenes", [])
+
+    # Pre-compute each node's local transform
+    local_transforms: List[np.ndarray] = []
+    for node in nodes:
+        local_transforms.append(_gltf_node_local_transform(node))
+
+    mesh_transforms: Dict[int, np.ndarray] = {}
+
+    def walk(node_idx: int, parent: np.ndarray):
+        if node_idx < 0 or node_idx >= len(nodes):
+            return
+        node = nodes[node_idx]
+        world = parent @ local_transforms[node_idx]
+
+        mesh_idx = node.get("mesh")
+        if mesh_idx is not None:
+            mesh_transforms[mesh_idx] = world
+
+        for child_idx in node.get("children", []):
+            walk(child_idx, world)
+
+    identity = np.eye(4, dtype=np.float64)
+
+    if scenes:
+        for root_idx in scenes[0].get("nodes", []):
+            walk(root_idx, identity)
+    else:
+        # No scene — walk all root-level nodes
+        for i in range(len(nodes)):
+            if i not in mesh_transforms:
+                walk(i, identity)
+
+    return mesh_transforms
+
+
+def _gltf_node_local_transform(node: Dict) -> np.ndarray:
+    """Compute a node's local 4×4 transform from ``matrix`` or TRS."""
+    if "matrix" in node and len(node["matrix"]) == 16:
+        # Column-major → row-major
+        return np.array(node["matrix"], dtype=np.float64).reshape(4, 4).T
+
+    T = np.eye(4, dtype=np.float64)
+
+    if "translation" in node:
+        t = node["translation"]
+        T[0, 3] = t[0]
+        T[1, 3] = t[1]
+        T[2, 3] = t[2]
+
+    if "rotation" in node:
+        # Quaternion [x, y, z, w]
+        qx, qy, qz, qw = node["rotation"]
+        R = np.eye(4, dtype=np.float64)
+        R[0, 0] = 1 - 2 * (qy * qy + qz * qz)
+        R[0, 1] = 2 * (qx * qy - qz * qw)
+        R[0, 2] = 2 * (qx * qz + qy * qw)
+        R[1, 0] = 2 * (qx * qy + qz * qw)
+        R[1, 1] = 1 - 2 * (qx * qx + qz * qz)
+        R[1, 2] = 2 * (qy * qz - qx * qw)
+        R[2, 0] = 2 * (qx * qz - qy * qw)
+        R[2, 1] = 2 * (qy * qz + qx * qw)
+        R[2, 2] = 1 - 2 * (qx * qx + qy * qy)
+        T = T @ R
+
+    if "scale" in node:
+        s = node["scale"]
+        S = np.eye(4, dtype=np.float64)
+        S[0, 0] = s[0]
+        S[1, 1] = s[1]
+        S[2, 2] = s[2]
+        T = T @ S
+
+    return T
+
+
+def _apply_mat4(mat: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply a 4×4 transform to an Nx3 array of points."""
+    if np.allclose(mat, np.eye(4)):
+        return pts
+    n = len(pts)
+    hom = np.ones((n, 4), dtype=np.float64)
+    hom[:, :3] = pts
+    return (mat @ hom.T).T[:, :3].astype(np.float32)
+
+
+def _apply_mat3_normals(mat: np.ndarray, normals: np.ndarray) -> np.ndarray:
+    """Transform normals by the upper-left 3×3 of a 4×4 matrix, then renormalise."""
+    if np.allclose(mat[:3, :3], np.eye(3)):
+        return normals
+    rot = mat[:3, :3]
+    tn = (rot @ normals.astype(np.float64).T).T.astype(np.float32)
+    lens = np.linalg.norm(tn, axis=1, keepdims=True)
+    lens[lens == 0] = 1.0
+    tn /= lens
+    return tn
 
 
 def _triangle_strip_to_triangles(indices: np.ndarray) -> np.ndarray:
@@ -899,9 +1189,16 @@ def _parse_glb_python(data: bytes):
     extensions_used = json_chunk.get("extensionsUsed", [])
     has_draco = "KHR_draco_mesh_compression" in extensions_used
 
-    for mesh in meshes:
+    # Also apply glTF node transforms from the scene graph
+    node_transforms = _compute_gltf_node_transforms(json_chunk)
+
+    for mesh_idx, mesh in enumerate(meshes):
+        # Find the world transform for this mesh (from the glTF node tree)
+        mesh_world = node_transforms.get(mesh_idx, np.eye(4, dtype=np.float64))
+
         for primitive in mesh.get("primitives", []):
             attrs = primitive.get("attributes", {})
+            prim_verts = None   # Track positions added in THIS iteration
 
             # ── If this primitive uses Draco compression, try to decode it ──
             draco_ext = primitive.get("extensions", {}).get(
@@ -913,8 +1210,11 @@ def _parse_glb_python(data: bytes):
                 )
                 if draco_result is not None:
                     d_pos, d_norm, d_uv, d_idx = draco_result
+                    # Apply glTF node transform
+                    d_pos = _apply_mat4(mesh_world, d_pos)
                     all_positions.append(d_pos)
                     if d_norm is not None:
+                        d_norm = _apply_mat3_normals(mesh_world, d_norm)
                         all_normals.append(d_norm)
                     if d_uv is not None:
                         all_texcoords.append(d_uv)
@@ -923,31 +1223,34 @@ def _parse_glb_python(data: bytes):
                     base_vertex += len(d_pos)
                     continue  # Don't also read the fallback accessors
                 # If Draco decode failed, fall through to regular accessors
-                # (they may contain quantized fallback data)
 
             # Positions
             if "POSITION" in attrs:
                 pos_data = _read_accessor(accessors[attrs["POSITION"]], buffer_views, bin_chunk)
                 if pos_data is not None:
                     verts = np.frombuffer(pos_data, dtype=np.float32).reshape(-1, 3)
+                    # Apply glTF node transform
+                    verts = _apply_mat4(mesh_world, verts)
                     all_positions.append(verts)
+                    prim_verts = verts
 
             # Normals
-            if "NORMAL" in attrs:
+            if "NORMAL" in attrs and prim_verts is not None:
                 norm_data = _read_accessor(accessors[attrs["NORMAL"]], buffer_views, bin_chunk)
                 if norm_data is not None:
                     norms = np.frombuffer(norm_data, dtype=np.float32).reshape(-1, 3)
+                    norms = _apply_mat3_normals(mesh_world, norms)
                     all_normals.append(norms)
 
             # Texcoords
-            if "TEXCOORD_0" in attrs:
+            if "TEXCOORD_0" in attrs and prim_verts is not None:
                 uv_data = _read_accessor(accessors[attrs["TEXCOORD_0"]], buffer_views, bin_chunk)
                 if uv_data is not None:
                     uvs = np.frombuffer(uv_data, dtype=np.float32).reshape(-1, 2)
                     all_texcoords.append(uvs)
 
             # Indices
-            if "indices" in primitive:
+            if "indices" in primitive and prim_verts is not None:
                 idx_accessor = accessors[primitive["indices"]]
                 idx_data = _read_accessor(idx_accessor, buffer_views, bin_chunk)
                 if idx_data is not None:
@@ -962,24 +1265,21 @@ def _parse_glb_python(data: bytes):
                     prim_mode = primitive.get("mode", 4)  # default = TRIANGLES
 
                     if prim_mode == 5:
-                        # TRIANGLE_STRIP → convert to individual triangles
                         idxs = _triangle_strip_to_triangles(idxs)
                     elif prim_mode == 6:
-                        # TRIANGLE_FAN → convert to individual triangles
                         idxs = _triangle_fan_to_triangles(idxs)
                     elif prim_mode != 4:
-                        # Not a triangle-based primitive — skip
                         continue
 
                     if len(idxs) >= 3 and len(idxs) % 3 == 0:
                         all_indices.append(idxs.reshape(-1, 3) + base_vertex)
                     elif len(idxs) >= 3:
-                        # Truncate to nearest multiple of 3 (safety net)
                         trim = len(idxs) - (len(idxs) % 3)
                         all_indices.append(idxs[:trim].reshape(-1, 3) + base_vertex)
 
-            if all_positions:
-                base_vertex += len(all_positions[-1])
+            # Only update base_vertex if we actually added positions this round
+            if prim_verts is not None:
+                base_vertex += len(prim_verts)
 
     if not all_positions:
         return None
