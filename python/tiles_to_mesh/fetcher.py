@@ -327,9 +327,19 @@ def _collect_tile_urls(
         uri = content.get("uri", "")
         if uri:
             if uri.startswith("http"):
+                # Absolute URL — just append the API key
                 url = f"{uri}&key={api_key}" if "?" in uri else f"{uri}?key={api_key}"
+            elif uri.startswith("/"):
+                # Root-relative path (e.g. /v1/3dtiles/datasets/...)
+                # Attach to the host only, not TILES_API_BASE, to avoid
+                # duplicating the /v1/3dtiles prefix.
+                base_host = "https://tile.googleapis.com"
+                sep = "&" if "?" in uri else "?"
+                url = f"{base_host}{uri}{sep}key={api_key}"
             else:
-                url = f"{TILES_API_BASE}/{uri}?key={api_key}"
+                # Relative path — append to the base URL
+                sep = "&" if "?" in uri else "?"
+                url = f"{TILES_API_BASE}/{uri}{sep}key={api_key}"
             urls.append(url)
     else:
         for child in children:
