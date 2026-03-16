@@ -229,7 +229,7 @@ def _fetch_mesh_python(
         print("Traversing tileset tree…")
 
     stats = _TraversalStats(verbose=show_progress)
-    glb_urls = _collect_glb_urls(
+    tile_entries = _collect_glb_urls(
         node=root_tileset.get("root", {}),
         aabb=polygon_aabb,
         target_error=target_error,
@@ -242,7 +242,7 @@ def _fetch_mesh_python(
     if show_progress:
         stats.print_summary()
 
-    if not glb_urls:
+    if not tile_entries:
         raise RuntimeError(
             "No GLB tiles found for the selected region.\n"
             f"Traversal stats: {stats}\n"
@@ -253,13 +253,13 @@ def _fetch_mesh_python(
         )
 
     if show_progress:
-        print(f"Found {len(glb_urls)} GLB tiles to download.")
-        debug_url = glb_urls[0]
+        print(f"Found {len(tile_entries)} GLB tiles to download.")
+        debug_url = tile_entries[0][0]
         if api_key in debug_url:
             debug_url = debug_url.replace(api_key, "***")
         print(f"  Example URL: {debug_url}")
 
-    # Step 3: Download GLBs and parse them
+    # Step 3: Download GLBs, parse them, and apply tile transforms
     all_vertices = []
     all_normals = []
     all_texcoords = []
@@ -268,9 +268,9 @@ def _fetch_mesh_python(
     vertex_offset = 0
     n_skipped = 0
 
-    iterator = tqdm(glb_urls, desc="Downloading GLBs", unit="tile") if show_progress else glb_urls
+    iterator = tqdm(tile_entries, desc="Downloading GLBs", unit="tile") if show_progress else tile_entries
 
-    for url in iterator:
+    for url, tile_transform in iterator:
         try:
             tile_resp = http.get(url, timeout=30)
             tile_resp.raise_for_status()
@@ -283,15 +283,30 @@ def _fetch_mesh_python(
 
             verts, norms, uvs, idxs, tex = mesh_data
 
-            all_vertices.append(verts)
+            # ── Apply the tile's accumulated transform ────────────────
+            # verts is Nx3.  Extend to homogeneous Nx4, multiply, drop w.
+            n = len(verts)
+            hom = np.ones((n, 4), dtype=np.float64)
+            hom[:, :3] = verts
+            transformed = (tile_transform @ hom.T).T[:, :3].astype(np.float32)
+            all_vertices.append(transformed)
+
+            # Normals are transformed by the upper-left 3x3 (no translation)
             if norms is not None:
-                all_normals.append(norms)
+                rot = tile_transform[:3, :3]
+                transformed_norms = (rot @ norms.astype(np.float64).T).T.astype(np.float32)
+                # Re-normalise
+                lens = np.linalg.norm(transformed_norms, axis=1, keepdims=True)
+                lens[lens == 0] = 1.0
+                transformed_norms /= lens
+                all_normals.append(transformed_norms)
+
             if uvs is not None:
                 all_texcoords.append(uvs)
 
             # Offset indices
             all_indices.append(idxs + vertex_offset)
-            vertex_offset += len(verts)
+            vertex_offset += n
 
             if tex is not None:
                 all_textures.append(tex)
@@ -310,11 +325,16 @@ def _fetch_mesh_python(
             "All tile responses were received but contained no valid GLB geometry."
         )
 
-    # Step 4: Assemble
+    # Step 4: Assemble — vertices are now in ECEF (metres)
     vertices = np.vstack(all_vertices)
     indices = np.vstack(all_indices)
     normals = np.vstack(all_normals) if all_normals else None
     texcoords = np.vstack(all_texcoords) if all_texcoords else None
+
+    # Step 5: Convert ECEF to local ENU (East-North-Up) so the mesh
+    #         is centred near the origin and oriented sensibly.
+    centroid_lat, centroid_lng = _polygon_centroid(polygon)
+    vertices, normals = _ecef_to_enu_mesh(vertices, normals, centroid_lat, centroid_lng)
 
     mesh = Mesh(
         vertices=vertices,
@@ -485,6 +505,90 @@ def _ecef_to_latlng(x: float, y: float, z: float) -> Tuple[float, float]:
     return lat, lng
 
 
+def _polygon_centroid(polygon: List[Tuple[float, float]]) -> Tuple[float, float]:
+    """Return the (lat, lng) centroid of a polygon."""
+    lats = [p[0] for p in polygon]
+    lngs = [p[1] for p in polygon]
+    return float(np.mean(lats)), float(np.mean(lngs))
+
+
+def _ecef_to_enu_mesh(
+    vertices: np.ndarray,
+    normals: Optional[np.ndarray],
+    ref_lat: float,
+    ref_lng: float,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Convert ECEF vertices/normals to a local East-North-Up frame.
+
+    The ENU frame is centred on the WGS-84 surface point at
+    (ref_lat, ref_lng) so the mesh ends up near the origin with
+    X = East, Y = Up, Z = North  (to match typical 3D viewer conventions
+    where Y is up).
+
+    Args:
+        vertices: Nx3 float32 array of ECEF positions (metres).
+        normals: Optional Nx3 float32 array of ECEF normals.
+        ref_lat: Reference latitude in degrees.
+        ref_lng: Reference longitude in degrees.
+
+    Returns:
+        (vertices_enu, normals_enu) — same shapes, float32.
+    """
+    import math
+
+    lat_r = math.radians(ref_lat)
+    lng_r = math.radians(ref_lng)
+
+    sin_lat = math.sin(lat_r)
+    cos_lat = math.cos(lat_r)
+    sin_lng = math.sin(lng_r)
+    cos_lng = math.cos(lng_r)
+
+    # WGS-84 reference point on the ellipsoid surface
+    a = 6_378_137.0            # semi-major axis (m)
+    e2 = 6.69437999014e-3      # first eccentricity squared
+    N = a / math.sqrt(1 - e2 * sin_lat ** 2)
+
+    ref_x = N * cos_lat * cos_lng
+    ref_y = N * cos_lat * sin_lng
+    ref_z = N * (1 - e2) * sin_lat
+
+    # Rotation matrix: ECEF → ENU
+    # ENU basis vectors in ECEF:
+    #   e_east  = [-sin_lng,          cos_lng,         0        ]
+    #   e_north = [-sin_lat*cos_lng, -sin_lat*sin_lng, cos_lat  ]
+    #   e_up    = [ cos_lat*cos_lng,  cos_lat*sin_lng, sin_lat  ]
+    R = np.array([
+        [-sin_lng,          cos_lng,          0.0     ],
+        [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat],
+        [cos_lat * cos_lng,  cos_lat * sin_lng,  sin_lat],
+    ], dtype=np.float64)
+
+    # Translate then rotate
+    delta = vertices.astype(np.float64) - np.array([ref_x, ref_y, ref_z], dtype=np.float64)
+    enu = (R @ delta.T).T  # Nx3
+
+    # Swap axes so Y is up: ENU → (East, Up, North) = (x_enu, z_enu, y_enu)
+    out_vertices = np.empty_like(enu, dtype=np.float32)
+    out_vertices[:, 0] = enu[:, 0]   # X = East
+    out_vertices[:, 1] = enu[:, 2]   # Y = Up
+    out_vertices[:, 2] = enu[:, 1]   # Z = North
+
+    out_normals = None
+    if normals is not None:
+        n_enu = (R @ normals.astype(np.float64).T).T
+        out_normals = np.empty_like(n_enu, dtype=np.float32)
+        out_normals[:, 0] = n_enu[:, 0]
+        out_normals[:, 1] = n_enu[:, 2]
+        out_normals[:, 2] = n_enu[:, 1]
+        # Re-normalise
+        lens = np.linalg.norm(out_normals, axis=1, keepdims=True)
+        lens[lens == 0] = 1.0
+        out_normals /= lens
+
+    return out_vertices, out_normals
+
+
 class _TraversalStats:
     """Tracks what happens during tileset tree traversal for debugging."""
 
@@ -522,6 +626,23 @@ class _TraversalStats:
 _MAX_TRAVERSAL_DEPTH = 30
 
 
+def _get_node_transform(node: Dict) -> np.ndarray:
+    """Extract the 4x4 transform matrix from a 3D Tiles node.
+
+    The ``transform`` property is a 16-element array in **column-major** order
+    (OpenGL convention).  If absent, the identity matrix is returned.
+    """
+    t = node.get("transform")
+    if t and len(t) == 16:
+        # Column-major → row-major (numpy default)
+        return np.array(t, dtype=np.float64).reshape(4, 4).T
+    return np.eye(4, dtype=np.float64)
+
+
+# Return type: list of (url, accumulated_4x4_transform)
+_TileEntry = Tuple[str, np.ndarray]
+
+
 def _collect_glb_urls(
     node: Dict,
     aabb: Tuple[float, float, float, float],
@@ -531,7 +652,8 @@ def _collect_glb_urls(
     http: requests.Session,
     stats: _TraversalStats,
     _depth: int = 0,
-) -> List[str]:
+    _parent_transform: Optional[np.ndarray] = None,
+) -> List[_TileEntry]:
     """Walk the 3D Tiles tree, fetching child tileset JSONs as needed.
 
     Google's Map Tiles API returns a tree of tileset JSON files that must
@@ -539,6 +661,9 @@ def _collect_glb_urls(
     reference them via ``content.uri`` that ends in ``.json``.  Only leaf
     nodes (those whose ``content.uri`` is **not** JSON) contain actual
     GLB mesh data — those are the URLs we collect.
+
+    Returns a list of ``(url, transform)`` tuples where *transform* is the
+    accumulated 4×4 matrix that places the tile's local vertices into ECEF.
     """
     stats.nodes_visited += 1
     stats.max_depth = max(stats.max_depth, _depth)
@@ -550,6 +675,12 @@ def _collect_glb_urls(
         stats.nodes_culled += 1
         return []
 
+    # Accumulate this node's transform with its parent's
+    if _parent_transform is None:
+        _parent_transform = np.eye(4, dtype=np.float64)
+    node_local = _get_node_transform(node)
+    accumulated = _parent_transform @ node_local
+
     geometric_error = node.get("geometricError", 0.0)
     children = node.get("children", [])
     content = node.get("content", {})
@@ -560,12 +691,13 @@ def _collect_glb_urls(
 
     # If we want to refine and have inline children, traverse them.
     if want_refine and children:
-        urls: List[str] = []
+        entries: List[_TileEntry] = []
         for child in children:
-            urls.extend(
-                _collect_glb_urls(child, aabb, target_error, api_key, session_token, http, stats, _depth + 1)
+            entries.extend(
+                _collect_glb_urls(child, aabb, target_error, api_key, session_token,
+                                  http, stats, _depth + 1, accumulated)
             )
-        return urls
+        return entries
 
     # If we want to refine but have NO inline children, the content URI
     # may point to a child tileset JSON — fetch and traverse it.
@@ -574,7 +706,8 @@ def _collect_glb_urls(
         if child_tileset is not None:
             child_root = child_tileset.get("root", child_tileset)
             return _collect_glb_urls(
-                child_root, aabb, target_error, api_key, session_token, http, stats, _depth + 1
+                child_root, aabb, target_error, api_key, session_token,
+                http, stats, _depth + 1, accumulated
             )
         return []
 
@@ -587,12 +720,13 @@ def _collect_glb_urls(
             if child_tileset is not None:
                 child_root = child_tileset.get("root", child_tileset)
                 return _collect_glb_urls(
-                    child_root, aabb, target_error, api_key, session_token, http, stats, _depth + 1
+                    child_root, aabb, target_error, api_key, session_token,
+                    http, stats, _depth + 1, accumulated
                 )
             return []
         else:
             stats.glb_found += 1
-            return [_resolve_uri(content_uri, api_key, session_token)]
+            return [(_resolve_uri(content_uri, api_key, session_token), accumulated)]
 
     return []
 

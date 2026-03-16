@@ -223,26 +223,31 @@ class MeshViewer:
         return container
 
     def _create_lights(self, center: np.ndarray, scale: float) -> list:
-        """Create lighting setup based on preset."""
+        """Create lighting setup based on preset.
+
+        Uses PointLight instead of DirectionalLight to avoid a TraitError
+        in newer pythreejs versions where DirectionalLight.target expects
+        an Object3D instance rather than a model reference string.
+        """
         import pythreejs as p3
 
         lights = []
 
         if self.lighting == "studio":
             lights.append(p3.AmbientLight(color="#404040", intensity=0.6))
-            lights.append(p3.DirectionalLight(
+            lights.append(p3.PointLight(
                 color="#ffffff",
                 position=[scale * 2, scale * 3, scale * 2],
                 intensity=1.0,
             ))
-            lights.append(p3.DirectionalLight(
+            lights.append(p3.PointLight(
                 color="#8888ff",
                 position=[-scale * 2, scale, -scale * 2],
                 intensity=0.4,
             ))
         elif self.lighting == "outdoor":
             lights.append(p3.AmbientLight(color="#87CEEB", intensity=0.5))
-            lights.append(p3.DirectionalLight(
+            lights.append(p3.PointLight(
                 color="#FFF5E1",
                 position=[scale, scale * 5, scale * 2],
                 intensity=1.2,
@@ -254,12 +259,12 @@ class MeshViewer:
             ))
         else:  # default
             lights.append(p3.AmbientLight(color="#404040", intensity=0.5))
-            lights.append(p3.DirectionalLight(
+            lights.append(p3.PointLight(
                 color="#ffffff",
                 position=[scale * 2, scale * 3, scale],
                 intensity=0.8,
             ))
-            lights.append(p3.DirectionalLight(
+            lights.append(p3.PointLight(
                 color="#ffffff",
                 position=[-scale, scale * 2, -scale],
                 intensity=0.3,
