@@ -400,12 +400,20 @@ def _resolve_uri(uri: str, api_key: str, session_token: Optional[str] = None) ->
 
 
 def _node_intersects_aabb(node: Dict, aabb: Tuple[float, float, float, float]) -> bool:
-    """Check whether a tile node's bounding volume intersects the polygon AABB."""
+    """Check whether a tile node's bounding volume intersects the polygon AABB.
+
+    Args:
+        node: A 3D Tiles node dict.
+        aabb: (min_lat, max_lat, min_lng, max_lng) of the target polygon.
+
+    Supports both "region" (radians) and "box" (ECEF OBB) bounding volumes
+    used by Google's Map Tiles API.
+    """
     import math
 
     bv = node.get("boundingVolume", {})
 
-    # 3D Tiles "region" bounding volume: [west, south, east, north, minH, maxH] in radians
+    # ── "region" bounding volume: [west, south, east, north, minH, maxH] in radians
     if "region" in bv:
         region = bv["region"]
         if len(region) >= 4:
@@ -416,10 +424,65 @@ def _node_intersects_aabb(node: Dict, aabb: Tuple[float, float, float, float]) -
             min_lat, max_lat, min_lng, max_lng = aabb
             if east < min_lng or west > max_lng or north < min_lat or south > max_lat:
                 return False
+        return True
 
-    # "box" and "sphere" bounding volumes — we can't easily cull them
-    # without a full ECEF→WGS84 transform, so conservatively keep them.
+    # ── "box" bounding volume: 12 floats — center (3) + 3 half-axis vectors (9)
+    #    All in ECEF metres.  Google's Photorealistic 3D Tiles use this format.
+    if "box" in bv:
+        box = bv["box"]
+        if len(box) >= 12:
+            cx, cy, cz = box[0], box[1], box[2]
+
+            # Convert ECEF center → lat/lng (spherical approximation)
+            center_lat, center_lng = _ecef_to_latlng(cx, cy, cz)
+
+            # Compute the maximum extent of the OBB (half-diagonal length)
+            hx = math.sqrt(box[3] ** 2 + box[4] ** 2 + box[5] ** 2)
+            hy = math.sqrt(box[6] ** 2 + box[7] ** 2 + box[8] ** 2)
+            hz = math.sqrt(box[9] ** 2 + box[10] ** 2 + box[11] ** 2)
+            half_diag_m = math.sqrt(hx ** 2 + hy ** 2 + hz ** 2)
+
+            # Convert metres to approximate degrees (generous margin)
+            m_per_deg = 111_320.0
+            margin_deg = half_diag_m / m_per_deg
+
+            min_lat, max_lat, min_lng, max_lng = aabb
+            if (center_lat + margin_deg < min_lat or
+                center_lat - margin_deg > max_lat or
+                center_lng + margin_deg < min_lng or
+                center_lng - margin_deg > max_lng):
+                return False
+        return True
+
+    # ── "sphere" bounding volume: [cx, cy, cz, radius] in ECEF metres
+    if "sphere" in bv:
+        sphere = bv["sphere"]
+        if len(sphere) >= 4:
+            cx, cy, cz, radius = sphere[0], sphere[1], sphere[2], sphere[3]
+            center_lat, center_lng = _ecef_to_latlng(cx, cy, cz)
+            margin_deg = radius / 111_320.0
+            min_lat, max_lat, min_lng, max_lng = aabb
+            if (center_lat + margin_deg < min_lat or
+                center_lat - margin_deg > max_lat or
+                center_lng + margin_deg < min_lng or
+                center_lng - margin_deg > max_lng):
+                return False
+        return True
+
+    # No bounding volume → conservatively keep it
     return True
+
+
+def _ecef_to_latlng(x: float, y: float, z: float) -> Tuple[float, float]:
+    """Convert ECEF coordinates to (latitude, longitude) in degrees.
+
+    Uses a simple spherical approximation (good enough for culling).
+    """
+    import math
+    lng = math.degrees(math.atan2(y, x))
+    hyp = math.sqrt(x * x + y * y)
+    lat = math.degrees(math.atan2(z, hyp))
+    return lat, lng
 
 
 class _TraversalStats:
