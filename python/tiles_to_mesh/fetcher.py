@@ -218,20 +218,27 @@ def _fetch_mesh_python(
     if show_progress:
         print("Traversing tileset tree…")
 
+    stats = _TraversalStats(verbose=show_progress)
     glb_urls = _collect_glb_urls(
         node=root_tileset.get("root", {}),
         aabb=polygon_aabb,
         target_error=target_error,
         api_key=api_key,
         http=http,
-        show_progress=show_progress,
+        stats=stats,
     )
+
+    if show_progress:
+        stats.print_summary()
 
     if not glb_urls:
         raise RuntimeError(
-            "No GLB tiles found for the selected region. "
-            "Check that the polygon coordinates are correct and the API key "
-            "has the 'Map Tiles API' enabled."
+            "No GLB tiles found for the selected region.\n"
+            f"Traversal stats: {stats}\n"
+            "Check that:\n"
+            "  - The polygon coordinates are correct\n"
+            "  - The API key has the 'Map Tiles API' enabled\n"
+            "  - The region has 3D tile coverage"
         )
 
     if show_progress:
@@ -362,13 +369,50 @@ def _node_intersects_aabb(node: Dict, aabb: Tuple[float, float, float, float]) -
     return True
 
 
+class _TraversalStats:
+    """Tracks what happens during tileset tree traversal for debugging."""
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.json_fetched = 0
+        self.json_failed = 0
+        self.json_errors: List[str] = []   # first few error messages
+        self.glb_found = 0
+        self.nodes_visited = 0
+        self.nodes_culled = 0
+        self.max_depth = 0
+
+    def print_summary(self) -> None:
+        if not self.verbose:
+            return
+        print(
+            f"  Tree traversal: {self.nodes_visited} nodes visited, "
+            f"{self.json_fetched} child JSONs fetched, "
+            f"{self.json_failed} fetch errors, "
+            f"{self.glb_found} GLB URLs found, "
+            f"max depth {self.max_depth}"
+        )
+        for err in self.json_errors[:3]:
+            print(f"    ⚠ {err}")
+
+    def __str__(self) -> str:
+        return (
+            f"nodes={self.nodes_visited}, json_fetched={self.json_fetched}, "
+            f"json_failed={self.json_failed}, glb_found={self.glb_found}, "
+            f"max_depth={self.max_depth}"
+        )
+
+
+_MAX_TRAVERSAL_DEPTH = 30
+
+
 def _collect_glb_urls(
     node: Dict,
     aabb: Tuple[float, float, float, float],
     target_error: float,
     api_key: str,
     http: requests.Session,
-    show_progress: bool,
+    stats: _TraversalStats,
     _depth: int = 0,
 ) -> List[str]:
     """Walk the 3D Tiles tree, fetching child tileset JSONs as needed.
@@ -379,7 +423,14 @@ def _collect_glb_urls(
     nodes (those whose ``content.uri`` is **not** JSON) contain actual
     GLB mesh data — those are the URLs we collect.
     """
+    stats.nodes_visited += 1
+    stats.max_depth = max(stats.max_depth, _depth)
+
+    if _depth > _MAX_TRAVERSAL_DEPTH:
+        return []
+
     if not _node_intersects_aabb(node, aabb):
+        stats.nodes_culled += 1
         return []
 
     geometric_error = node.get("geometricError", 0.0)
@@ -388,8 +439,6 @@ def _collect_glb_urls(
     content_uri = content.get("uri", content.get("url", ""))
 
     # ── Should we descend into children? ──────────────────────────────
-    # We drill deeper if geometricError is above the LOD threshold and
-    # there are children to descend into (inline or via a JSON URI).
     want_refine = geometric_error > target_error
 
     # If we want to refine and have inline children, traverse them.
@@ -397,33 +446,35 @@ def _collect_glb_urls(
         urls: List[str] = []
         for child in children:
             urls.extend(
-                _collect_glb_urls(child, aabb, target_error, api_key, http, show_progress, _depth + 1)
+                _collect_glb_urls(child, aabb, target_error, api_key, http, stats, _depth + 1)
             )
         return urls
 
     # If we want to refine but have NO inline children, the content URI
     # may point to a child tileset JSON — fetch and traverse it.
     if want_refine and content_uri and _looks_like_json_uri(content_uri):
-        child_tileset = _fetch_child_tileset(content_uri, api_key, http)
+        child_tileset = _fetch_child_tileset(content_uri, api_key, http, stats)
         if child_tileset is not None:
             child_root = child_tileset.get("root", child_tileset)
             return _collect_glb_urls(
-                child_root, aabb, target_error, api_key, http, show_progress, _depth + 1
+                child_root, aabb, target_error, api_key, http, stats, _depth + 1
             )
+        return []
 
     # ── Leaf node — collect the content URI if it looks like GLB ──────
     if content_uri:
         if _looks_like_json_uri(content_uri):
             # It's a JSON tileset — fetch and traverse it even though we've
             # reached the LOD threshold (the actual GLB is one level deeper).
-            child_tileset = _fetch_child_tileset(content_uri, api_key, http)
+            child_tileset = _fetch_child_tileset(content_uri, api_key, http, stats)
             if child_tileset is not None:
                 child_root = child_tileset.get("root", child_tileset)
                 return _collect_glb_urls(
-                    child_root, aabb, target_error, api_key, http, show_progress, _depth + 1
+                    child_root, aabb, target_error, api_key, http, stats, _depth + 1
                 )
             return []
         else:
+            stats.glb_found += 1
             return [_resolve_uri(content_uri, api_key)]
 
     return []
@@ -431,21 +482,31 @@ def _collect_glb_urls(
 
 def _looks_like_json_uri(uri: str) -> bool:
     """Heuristic: does this URI point to a tileset JSON rather than a GLB?"""
-    # Strip query string for extension check
     path = uri.split("?")[0]
     return path.endswith(".json")
 
 
 def _fetch_child_tileset(
-    uri: str, api_key: str, http: requests.Session
+    uri: str,
+    api_key: str,
+    http: requests.Session,
+    stats: _TraversalStats,
 ) -> Optional[Dict]:
     """Fetch a child tileset JSON, returning the parsed dict or None."""
     url = _resolve_uri(uri, api_key)
+    stats.json_fetched += 1
     try:
         resp = http.get(url, timeout=30)
         resp.raise_for_status()
         return resp.json()
-    except Exception:
+    except Exception as e:
+        stats.json_failed += 1
+        if len(stats.json_errors) < 5:
+            # Mask API key in error messages
+            err_str = str(e)
+            if api_key in err_str:
+                err_str = err_str.replace(api_key, "***")
+            stats.json_errors.append(err_str)
         return None
 
 
