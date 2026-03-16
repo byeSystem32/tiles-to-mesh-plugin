@@ -199,56 +199,68 @@ def _fetch_mesh_python(
     show_progress: bool,
 ) -> Mesh:
     """Pure-Python fallback for tile fetching (slower, no Rust required)."""
-    session = requests.Session()
+    http = requests.Session()
 
-    # Step 1: Create a session token for the 3D Tiles API
+    # Step 1: Fetch the root tileset
     if show_progress:
         print("Creating API session...")
 
     root_url = f"{TILES_API_BASE}/root.json?key={api_key}"
-    resp = session.get(root_url)
+    resp = http.get(root_url)
     resp.raise_for_status()
     root_tileset = resp.json()
 
-    # Step 2: Traverse tileset tree and collect tile URLs
+    # Step 2: Walk the tileset tree — recursively fetching child tileset
+    #         JSON files — until we reach leaf nodes with GLB content.
     target_error = LOD_THRESHOLDS.get(lod, 30.0)
     polygon_aabb = _compute_aabb(polygon)
-    tile_urls = _collect_tile_urls(root_tileset.get("root", {}), polygon_aabb, target_error, api_key)
 
-    if not tile_urls:
+    if show_progress:
+        print("Traversing tileset tree…")
+
+    glb_urls = _collect_glb_urls(
+        node=root_tileset.get("root", {}),
+        aabb=polygon_aabb,
+        target_error=target_error,
+        api_key=api_key,
+        http=http,
+        show_progress=show_progress,
+    )
+
+    if not glb_urls:
         raise RuntimeError(
-            "No tiles found for the selected region. "
-            "Check that the polygon coordinates are correct and the API key has 3D Tiles access."
+            "No GLB tiles found for the selected region. "
+            "Check that the polygon coordinates are correct and the API key "
+            "has the 'Map Tiles API' enabled."
         )
 
     if show_progress:
-        print(f"Found {len(tile_urls)} tiles to fetch.")
-        # Show first URL for debugging (mask the API key)
-        if tile_urls:
-            debug_url = tile_urls[0]
-            # Mask the key in the debug output
-            if api_key in debug_url:
-                debug_url = debug_url.replace(api_key, "***")
-            print(f"  First tile URL: {debug_url}")
+        print(f"Found {len(glb_urls)} GLB tiles to download.")
+        debug_url = glb_urls[0]
+        if api_key in debug_url:
+            debug_url = debug_url.replace(api_key, "***")
+        print(f"  Example URL: {debug_url}")
 
-    # Step 3: Fetch tile GLBs
+    # Step 3: Download GLBs and parse them
     all_vertices = []
     all_normals = []
     all_texcoords = []
     all_indices = []
     all_textures = []
     vertex_offset = 0
+    n_skipped = 0
 
-    iterator = tqdm(tile_urls, desc="Fetching tiles", unit="tile") if show_progress else tile_urls
+    iterator = tqdm(glb_urls, desc="Downloading GLBs", unit="tile") if show_progress else glb_urls
 
     for url in iterator:
         try:
-            tile_resp = session.get(url, timeout=30)
+            tile_resp = http.get(url, timeout=30)
             tile_resp.raise_for_status()
             glb_data = tile_resp.content
 
             mesh_data = _parse_glb_python(glb_data)
             if mesh_data is None:
+                n_skipped += 1
                 continue
 
             verts, norms, uvs, idxs, tex = mesh_data
@@ -271,13 +283,13 @@ def _fetch_mesh_python(
                 print(f"  Warning: Failed to fetch tile: {e}")
             continue
 
+    if show_progress and n_skipped:
+        print(f"  ({n_skipped} tiles had no parseable mesh data)")
+
     if not all_vertices:
         raise RuntimeError(
-            "Failed to fetch any tile data. All tile requests failed.\n"
-            "Common causes:\n"
-            "  - API key does not have the 'Map Tiles API' enabled\n"
-            "  - Malformed tile URLs (check the 'First tile URL' printed above)\n"
-            "  - Region is too small or has no 3D tile coverage"
+            "Failed to extract any mesh data from the downloaded tiles.\n"
+            "All tile responses were received but contained no valid GLB geometry."
         )
 
     # Step 4: Assemble
@@ -302,6 +314,11 @@ def _fetch_mesh_python(
     return mesh
 
 
+# ── Tile tree helpers ─────────────────────────────────────────────────
+
+_BASE_HOST = "https://tile.googleapis.com"
+
+
 def _compute_aabb(polygon: List[Tuple[float, float]]) -> Tuple[float, float, float, float]:
     """Compute axis-aligned bounding box from polygon. Returns (min_lat, max_lat, min_lng, max_lng)."""
     lats = [p[0] for p in polygon]
@@ -309,56 +326,127 @@ def _compute_aabb(polygon: List[Tuple[float, float]]) -> Tuple[float, float, flo
     return (min(lats), max(lats), min(lngs), max(lngs))
 
 
-def _collect_tile_urls(
-    node: Dict,
-    aabb: Tuple[float, float, float, float],
-    target_error: float,
-    api_key: str,
-) -> List[str]:
-    """Recursively collect tile content URLs from the tileset tree."""
-    urls = []
+def _resolve_uri(uri: str, api_key: str) -> str:
+    """Turn a tileset URI (absolute, root-relative, or relative) into a full URL."""
+    if uri.startswith("http"):
+        sep = "&" if "?" in uri else "?"
+        return f"{uri}{sep}key={api_key}"
+    elif uri.startswith("/"):
+        sep = "&" if "?" in uri else "?"
+        return f"{_BASE_HOST}{uri}{sep}key={api_key}"
+    else:
+        sep = "&" if "?" in uri else "?"
+        return f"{TILES_API_BASE}/{uri}{sep}key={api_key}"
 
-    # Check bounding volume
+
+def _node_intersects_aabb(node: Dict, aabb: Tuple[float, float, float, float]) -> bool:
+    """Check whether a tile node's bounding volume intersects the polygon AABB."""
+    import math
+
     bv = node.get("boundingVolume", {})
+
+    # 3D Tiles "region" bounding volume: [west, south, east, north, minH, maxH] in radians
     if "region" in bv:
         region = bv["region"]
         if len(region) >= 4:
-            import math
             west = math.degrees(region[0])
             south = math.degrees(region[1])
             east = math.degrees(region[2])
             north = math.degrees(region[3])
             min_lat, max_lat, min_lng, max_lng = aabb
             if east < min_lng or west > max_lng or north < min_lat or south > max_lat:
-                return urls
+                return False
+
+    # "box" and "sphere" bounding volumes — we can't easily cull them
+    # without a full ECEF→WGS84 transform, so conservatively keep them.
+    return True
+
+
+def _collect_glb_urls(
+    node: Dict,
+    aabb: Tuple[float, float, float, float],
+    target_error: float,
+    api_key: str,
+    http: requests.Session,
+    show_progress: bool,
+    _depth: int = 0,
+) -> List[str]:
+    """Walk the 3D Tiles tree, fetching child tileset JSONs as needed.
+
+    Google's Map Tiles API returns a tree of tileset JSON files that must
+    be fetched recursively.  Each JSON may embed children inline or
+    reference them via ``content.uri`` that ends in ``.json``.  Only leaf
+    nodes (those whose ``content.uri`` is **not** JSON) contain actual
+    GLB mesh data — those are the URLs we collect.
+    """
+    if not _node_intersects_aabb(node, aabb):
+        return []
 
     geometric_error = node.get("geometricError", 0.0)
     children = node.get("children", [])
+    content = node.get("content", {})
+    content_uri = content.get("uri", content.get("url", ""))
 
-    if geometric_error <= target_error or not children:
-        content = node.get("content", {})
-        uri = content.get("uri", "")
-        if uri:
-            if uri.startswith("http"):
-                # Absolute URL — just append the API key
-                url = f"{uri}&key={api_key}" if "?" in uri else f"{uri}?key={api_key}"
-            elif uri.startswith("/"):
-                # Root-relative path (e.g. /v1/3dtiles/datasets/...)
-                # Attach to the host only, not TILES_API_BASE, to avoid
-                # duplicating the /v1/3dtiles prefix.
-                base_host = "https://tile.googleapis.com"
-                sep = "&" if "?" in uri else "?"
-                url = f"{base_host}{uri}{sep}key={api_key}"
-            else:
-                # Relative path — append to the base URL
-                sep = "&" if "?" in uri else "?"
-                url = f"{TILES_API_BASE}/{uri}{sep}key={api_key}"
-            urls.append(url)
-    else:
+    # ── Should we descend into children? ──────────────────────────────
+    # We drill deeper if geometricError is above the LOD threshold and
+    # there are children to descend into (inline or via a JSON URI).
+    want_refine = geometric_error > target_error
+
+    # If we want to refine and have inline children, traverse them.
+    if want_refine and children:
+        urls: List[str] = []
         for child in children:
-            urls.extend(_collect_tile_urls(child, aabb, target_error, api_key))
+            urls.extend(
+                _collect_glb_urls(child, aabb, target_error, api_key, http, show_progress, _depth + 1)
+            )
+        return urls
 
-    return urls
+    # If we want to refine but have NO inline children, the content URI
+    # may point to a child tileset JSON — fetch and traverse it.
+    if want_refine and content_uri and _looks_like_json_uri(content_uri):
+        child_tileset = _fetch_child_tileset(content_uri, api_key, http)
+        if child_tileset is not None:
+            child_root = child_tileset.get("root", child_tileset)
+            return _collect_glb_urls(
+                child_root, aabb, target_error, api_key, http, show_progress, _depth + 1
+            )
+
+    # ── Leaf node — collect the content URI if it looks like GLB ──────
+    if content_uri:
+        if _looks_like_json_uri(content_uri):
+            # It's a JSON tileset — fetch and traverse it even though we've
+            # reached the LOD threshold (the actual GLB is one level deeper).
+            child_tileset = _fetch_child_tileset(content_uri, api_key, http)
+            if child_tileset is not None:
+                child_root = child_tileset.get("root", child_tileset)
+                return _collect_glb_urls(
+                    child_root, aabb, target_error, api_key, http, show_progress, _depth + 1
+                )
+            return []
+        else:
+            return [_resolve_uri(content_uri, api_key)]
+
+    return []
+
+
+def _looks_like_json_uri(uri: str) -> bool:
+    """Heuristic: does this URI point to a tileset JSON rather than a GLB?"""
+    # Strip query string for extension check
+    path = uri.split("?")[0]
+    return path.endswith(".json")
+
+
+def _fetch_child_tileset(
+    uri: str, api_key: str, http: requests.Session
+) -> Optional[Dict]:
+    """Fetch a child tileset JSON, returning the parsed dict or None."""
+    url = _resolve_uri(uri, api_key)
+    try:
+        resp = http.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
 
 
 def _parse_glb_python(data: bytes):
