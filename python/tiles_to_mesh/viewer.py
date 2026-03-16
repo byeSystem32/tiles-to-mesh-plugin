@@ -289,11 +289,14 @@ class MeshViewer:
         """Viewer using raw Three.js via HTML.
 
         Works everywhere (Colab, Jupyter, JupyterLab) because it doesn't
-        rely on the pythreejs widget-sync layer.  Uses an ES-module import
-        of Three.js from a CDN so there are no global-scope collisions.
+        rely on the pythreejs widget-sync layer.
+
+        Three.js is loaded via dynamically-created ``<script>`` elements
+        (classic, not ES-module) because Colab's output-cell iframe does
+        not support ``<script type="module">`` imports.  Mesh data is
+        passed as base64-encoded binary for compactness.
         """
         from IPython.display import display, HTML
-        import json
         import base64
         import uuid
 
@@ -301,101 +304,153 @@ class MeshViewer:
         bounds = mesh.bounds
         center = bounds["center"].tolist()
         max_dim = float(np.max(bounds["size"]))
+        if max_dim == 0:
+            max_dim = 1.0
 
-        # Serialize mesh data for JavaScript
-        vertices_list = mesh.vertices.flatten().tolist()
-        faces_list = mesh.faces.flatten().tolist()
+        # Encode mesh data as base64 binary (much smaller than JSON)
+        verts_b64 = base64.b64encode(
+            mesh.vertices.astype(np.float32).tobytes()
+        ).decode("ascii")
+        faces_b64 = base64.b64encode(
+            mesh.faces.astype(np.uint32).tobytes()
+        ).decode("ascii")
+        norms_b64 = ""
+        if mesh.has_normals and mesh.normals is not None:
+            norms_b64 = base64.b64encode(
+                mesh.normals.astype(np.float32).tobytes()
+            ).decode("ascii")
 
-        normals_js = "null"
-        if mesh.has_normals:
-            normals_js = json.dumps(mesh.normals.flatten().tolist())
-
-        viewer_id = f"ttm-viewer-{uuid.uuid4().hex[:8]}"
+        uid = uuid.uuid4().hex[:8]
 
         html = f"""
-        <div id="{viewer_id}" style="width:{self.width}px;height:{self.height}px;position:relative;border:1px solid #333;border-radius:4px;overflow:hidden;"></div>
-        <script type="module">
-        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
-        import {{ OrbitControls }} from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+<div id="ttm-{uid}"
+     style="width:{self.width}px;height:{self.height}px;position:relative;
+            border:1px solid #333;border-radius:4px;overflow:hidden;
+            background:{self.background};">
+  <div id="ttm-msg-{uid}"
+       style="color:#aaa;font:14px sans-serif;padding:20px;">
+    Loading 3D viewer…</div>
+</div>
+<script>
+(function() {{
+  /* ── helpers ─────────────────────────────────────────────── */
+  var uid  = '{uid}';
+  var box  = document.getElementById('ttm-' + uid);
+  var msg  = document.getElementById('ttm-msg-' + uid);
 
-        (function() {{
-            const container = document.getElementById('{viewer_id}');
-            if (!container) return;
+  function b64buf(b64) {{
+    var s = atob(b64), n = s.length, u = new Uint8Array(n);
+    for (var i = 0; i < n; i++) u[i] = s.charCodeAt(i);
+    return u.buffer;
+  }}
 
-            const scene = new THREE.Scene();
-            scene.background = new THREE.Color('{self.background}');
+  /* ── dynamic script loader ───────────────────────────────── */
+  function loadJS(url, cb) {{
+    var s = document.createElement('script');
+    s.src = url;
+    s.onload  = cb;
+    s.onerror = function() {{
+      msg.textContent = 'Failed to load ' + url;
+    }};
+    (document.head || document.documentElement).appendChild(s);
+  }}
 
-            const W = {self.width}, H = {self.height};
-            const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, {max_dim * 100});
-            camera.position.set(
-                {center[0] + max_dim * 0.5},
-                {center[1] + max_dim * 0.7},
-                {center[2] + max_dim * 0.5}
-            );
+  var THREE_CDN    = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+  var CONTROLS_CDN = 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js';
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-            renderer.setSize(W, H);
-            renderer.setPixelRatio(window.devicePixelRatio || 1);
-            container.appendChild(renderer.domElement);
+  /* If THREE is already on the page (multiple calls), skip loading */
+  if (typeof THREE !== 'undefined' && THREE.OrbitControls) {{
+    init();
+  }} else if (typeof THREE !== 'undefined') {{
+    loadJS(CONTROLS_CDN, init);
+  }} else {{
+    loadJS(THREE_CDN, function() {{
+      loadJS(CONTROLS_CDN, init);
+    }});
+  }}
 
-            const controls = new OrbitControls(camera, renderer.domElement);
-            controls.target.set({center[0]}, {center[1]}, {center[2]});
-            controls.enableDamping = true;
-            controls.dampingFactor = 0.12;
-            controls.update();
+  /* ── main viewer ─────────────────────────────────────────── */
+  function init() {{
+    if (msg) msg.remove();
 
-            // ── Geometry ──────────────────────────────────────────────
-            const geometry = new THREE.BufferGeometry();
-            const vertices = new Float32Array({json.dumps(vertices_list)});
-            geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+    var verts = new Float32Array(b64buf('{verts_b64}'));
+    var faces = new Uint32Array(b64buf('{faces_b64}'));
+    var nb64  = '{norms_b64}';
+    var norms = nb64 ? new Float32Array(b64buf(nb64)) : null;
 
-            const indices = new Uint32Array({json.dumps(faces_list)});
-            geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    var W = {self.width}, H = {self.height};
 
-            const normData = {normals_js};
-            if (normData) {{
-                geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normData), 3));
-            }} else {{
-                geometry.computeVertexNormals();
-            }}
+    var scene = new THREE.Scene();
+    scene.background = new THREE.Color('{self.background}');
 
-            const material = new THREE.MeshStandardMaterial({{
-                color: 0x8fa8c8,
-                wireframe: {'true' if self.wireframe else 'false'},
-                side: THREE.DoubleSide,
-                metalness: 0.1,
-                roughness: 0.7
-            }});
+    var camera = new THREE.PerspectiveCamera(50, W / H,
+        {max_dim * 0.001}, {max_dim * 200});
+    camera.position.set(
+        {center[0] + max_dim * 0.5},
+        {center[1] + max_dim * 0.7},
+        {center[2] + max_dim * 0.5});
 
-            const mesh = new THREE.Mesh(geometry, material);
-            scene.add(mesh);
+    var renderer = new THREE.WebGLRenderer({{ antialias: true }});
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    box.appendChild(renderer.domElement);
 
-            // ── Lighting ──────────────────────────────────────────────
-            scene.add(new THREE.AmbientLight(0x404040, 0.6));
-            const d1 = new THREE.DirectionalLight(0xffffff, 0.9);
-            d1.position.set({max_dim * 2}, {max_dim * 3}, {max_dim});
-            scene.add(d1);
-            const d2 = new THREE.DirectionalLight(0xffffff, 0.3);
-            d2.position.set(-{max_dim}, {max_dim * 2}, -{max_dim});
-            scene.add(d2);
+    var controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set({center[0]}, {center[1]}, {center[2]});
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.12;
+    controls.update();
 
-            // ── Info bar ──────────────────────────────────────────────
-            const info = document.createElement('div');
-            info.style.cssText = 'position:absolute;bottom:0;left:0;right:0;padding:4px 8px;'
-                + 'background:rgba(0,0,0,0.6);color:#eee;font:12px monospace;';
-            info.textContent = 'Vertices: {mesh.vertex_count:,} | Faces: {mesh.face_count:,}'
-                + ' | Drag to rotate, scroll to zoom';
-            container.appendChild(info);
+    /* geometry */
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position',
+        new THREE.BufferAttribute(verts, 3));
+    geo.setIndex(
+        new THREE.BufferAttribute(faces, 1));
+    if (norms) {{
+      geo.setAttribute('normal',
+          new THREE.BufferAttribute(norms, 3));
+    }} else {{
+      geo.computeVertexNormals();
+    }}
 
-            // ── Render loop ───────────────────────────────────────────
-            function animate() {{
-                requestAnimationFrame(animate);
-                controls.update();
-                renderer.render(scene, camera);
-            }}
-            animate();
-        }})();
-        </script>
-        """
+    var mat = new THREE.MeshStandardMaterial({{
+      color: 0x8fa8c8,
+      wireframe: {'true' if self.wireframe else 'false'},
+      side: THREE.DoubleSide,
+      metalness: 0.1,
+      roughness: 0.7
+    }});
+    scene.add(new THREE.Mesh(geo, mat));
+
+    /* lighting */
+    scene.add(new THREE.AmbientLight(0x404040, 0.6));
+    var d1 = new THREE.DirectionalLight(0xffffff, 0.9);
+    d1.position.set({max_dim * 2}, {max_dim * 3}, {max_dim});
+    scene.add(d1);
+    var d2 = new THREE.DirectionalLight(0xffffff, 0.3);
+    d2.position.set(-{max_dim}, {max_dim * 2}, -{max_dim});
+    scene.add(d2);
+
+    /* info bar */
+    var info = document.createElement('div');
+    info.style.cssText =
+        'position:absolute;bottom:0;left:0;right:0;padding:4px 8px;'
+      + 'background:rgba(0,0,0,0.6);color:#eee;font:12px monospace;';
+    info.textContent =
+        'Vertices: {mesh.vertex_count:,} | Faces: {mesh.face_count:,}'
+      + ' | Drag to rotate, scroll to zoom';
+    box.appendChild(info);
+
+    /* render loop */
+    (function animate() {{
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }})();
+  }}
+}})();
+</script>
+"""
 
         display(HTML(html))
