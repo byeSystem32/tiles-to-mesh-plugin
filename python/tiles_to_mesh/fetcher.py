@@ -279,6 +279,8 @@ def _fetch_mesh_python(
     n_skipped = 0
     n_parse_err = 0
     _first_tile_diagnosed = False
+    # Reset per-call diagnostic flag
+    _fetch_mesh_python._verts_diag_done = False  # type: ignore[attr-defined]
 
     parser = "trimesh" if HAS_TRIMESH else "builtin"
     if show_progress:
@@ -296,8 +298,18 @@ def _fetch_mesh_python(
             if show_progress and not _first_tile_diagnosed:
                 _first_tile_diagnosed = True
                 _dump_glb_info(glb_data)
+                # Also show the tileset accumulated transform for this tile
+                print(f"    [diag] Tileset accumulated transform (row-major):")
+                for row in tile_transform:
+                    print(f"    [diag]   [{row[0]:16.4f} {row[1]:16.4f} {row[2]:16.4f} {row[3]:16.4f}]")
 
             # ── Parse the GLB ─────────────────────────────────────
+            # trimesh applies the GLB's internal scene-graph transforms
+            # (node matrices).  We then apply the tileset accumulated
+            # transform on top.  However, Google's 3D Tiles sometimes
+            # embed the ECEF placement in the GLB node transform AND
+            # the tileset transform.  We detect this by checking if the
+            # parsed vertices are already in ECEF range (>1e6 metres).
             if HAS_TRIMESH:
                 parse_result = _parse_glb_with_trimesh(glb_data)
             else:
@@ -316,22 +328,47 @@ def _fetch_mesh_python(
                 n_skipped += 1
                 continue
 
-            # ── Apply the tile's accumulated transform ────────────
-            # verts is Nx3.  Extend to homogeneous Nx4, multiply, drop w.
-            n = len(verts)
-            hom = np.ones((n, 4), dtype=np.float64)
-            hom[:, :3] = verts
-            transformed = (tile_transform @ hom.T).T[:, :3].astype(np.float32)
-            all_vertices.append(transformed)
+            # ── Diagnostic: vertex range for first tile ───────────
+            if show_progress and not hasattr(_fetch_mesh_python, '_verts_diag_done'):
+                _fetch_mesh_python._verts_diag_done = True  # type: ignore[attr-defined]
+                vmin = verts.min(axis=0)
+                vmax = verts.max(axis=0)
+                print(f"    [diag] Raw parsed vertex range:")
+                print(f"    [diag]   min = ({vmin[0]:.4f}, {vmin[1]:.4f}, {vmin[2]:.4f})")
+                print(f"    [diag]   max = ({vmax[0]:.4f}, {vmax[1]:.4f}, {vmax[2]:.4f})")
+                mag = np.linalg.norm(verts.mean(axis=0))
+                print(f"    [diag]   mean magnitude = {mag:.1f}")
+                if mag > 1e6:
+                    print(f"    [diag]   ⚠ Vertices appear to be in ECEF already "
+                          f"(magnitude ~{mag:.0f} m)")
 
+            # ── Detect if trimesh already placed verts in ECEF ────
+            # If the mean vertex magnitude > 1 million metres, the GLB's
+            # internal node transform already placed them in ECEF space.
+            # Applying the tileset transform on top would double-place them.
+            vertex_mag = float(np.linalg.norm(verts.mean(axis=0)))
+            if vertex_mag > 1e6:
+                # Already in ECEF — skip the tileset transform
+                all_vertices.append(verts)
+            else:
+                # In tile-local space — apply tileset transform to get ECEF
+                n = len(verts)
+                hom = np.ones((n, 4), dtype=np.float64)
+                hom[:, :3] = verts
+                transformed = (tile_transform @ hom.T).T[:, :3].astype(np.float32)
+                all_vertices.append(transformed)
             # Normals are transformed by the upper-left 3×3 (no translation)
             if norms is not None and len(norms) == n:
-                rot = tile_transform[:3, :3]
-                tn = (rot @ norms.astype(np.float64).T).T.astype(np.float32)
-                lens = np.linalg.norm(tn, axis=1, keepdims=True)
-                lens[lens == 0] = 1.0
-                tn /= lens
-                all_normals.append(tn)
+                if vertex_mag <= 1e6:
+                    # Only transform normals if we also transformed vertices
+                    rot = tile_transform[:3, :3]
+                    tn = (rot @ norms.astype(np.float64).T).T.astype(np.float32)
+                    lens = np.linalg.norm(tn, axis=1, keepdims=True)
+                    lens[lens == 0] = 1.0
+                    tn /= lens
+                    all_normals.append(tn)
+                else:
+                    all_normals.append(norms)
 
             if uvs is not None and len(uvs) == n:
                 all_texcoords.append(uvs)
@@ -926,6 +963,21 @@ def _dump_glb_info(data: bytes) -> None:
               f"interleaved (byteStride>0): {has_stride}")
         print(f"    [diag] Draco compressed primitives: {has_draco}")
 
+        # Show node transform(s)
+        for i, node in enumerate(nodes):
+            if "matrix" in node:
+                m = node["matrix"]
+                # Column-major → row-major for display
+                mat = np.array(m, dtype=np.float64).reshape(4, 4).T
+                print(f"    [diag] Node {i} matrix (row-major):")
+                for row in mat:
+                    print(f"    [diag]   [{row[0]:16.4f} {row[1]:16.4f} {row[2]:16.4f} {row[3]:16.4f}]")
+            elif "translation" in node or "rotation" in node or "scale" in node:
+                print(f"    [diag] Node {i} TRS: "
+                      f"T={node.get('translation')}, "
+                      f"R={node.get('rotation')}, "
+                      f"S={node.get('scale')}")
+
         # Show first mesh's first primitive details
         if meshes and meshes[0].get("primitives"):
             prim = meshes[0]["primitives"][0]
@@ -937,6 +989,10 @@ def _dump_glb_info(data: bytes) -> None:
                 print(f"    [diag]   POSITION: count={pa.get('count')}, "
                       f"type={pa.get('type')}, componentType={pa.get('componentType')}, "
                       f"bufferView={pa.get('bufferView')}")
+                # Show accessor min/max (raw vertex range in GLB)
+                if "min" in pa and "max" in pa:
+                    print(f"    [diag]   POSITION min={pa['min']}")
+                    print(f"    [diag]   POSITION max={pa['max']}")
             draco = prim.get("extensions", {}).get("KHR_draco_mesh_compression")
             if draco:
                 print(f"    [diag]   Draco ext: bufferView={draco.get('bufferView')}, "
