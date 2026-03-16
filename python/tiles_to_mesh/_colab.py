@@ -55,79 +55,171 @@ def colab_register_callback(name: str, callback: Callable) -> None:
 
 
 class ColabMapSelector:
-    """Colab-specific map selector using google.colab.output for JS↔Python communication.
+    """Colab-specific map selector using google.colab.output for JS-Python communication.
 
-    This is used internally when running in Colab, where ipywidgets
-    communication may not work reliably.
+    This is used internally by MapSelector when running in Colab, where
+    ipywidgets communication does not work reliably.
+
+    The map is rendered in a self-contained <iframe> with srcdoc so that the
+    Google Maps JavaScript API loads in a clean browsing context (no CSP
+    conflicts with Colab's own scripts).  When the user finishes drawing a
+    polygon the coordinates are sent back to Python via
+    ``google.colab.kernel.invokeFunction``.
     """
 
-    def __init__(self, api_key: str, center: Tuple[float, float] = (40.748817, -73.985428), zoom: int = 15):
+    def __init__(
+        self,
+        api_key: str,
+        center: Tuple[float, float] = (40.748817, -73.985428),
+        zoom: int = 15,
+        height: int = 600,
+        map_type: str = "satellite",
+    ):
         self._api_key = api_key
         self._center = center
         self._zoom = zoom
+        self._height = height
+        self._map_type = map_type
         self._polygon_coords: List[Tuple[float, float]] = []
+        self._region = None  # Optional[Region] — resolved at runtime via tiles_to_mesh.selector
+
+    # ── public API ────────────────────────────────────────────────────
 
     def show(self) -> None:
-        """Display the map selector in Colab."""
+        """Display the interactive map selector in Colab."""
         from IPython.display import display, HTML
-        from google.colab import output
+        from google.colab import output as colab_output
 
-        # Register the callback for receiving coordinates
-        output.register_callback("ttm_set_coords", self._receive_coords)
+        # Register Python callback so JS can send coordinates back
+        colab_output.register_callback("ttm_set_coords", self._receive_coords)
 
-        html = f"""
-        <div id="ttm-colab-map" style="width: 100%; height: 600px;"></div>
-        <div id="ttm-colab-status" style="padding: 10px; font-family: monospace;"></div>
-        <script src="https://maps.googleapis.com/maps/api/js?key={self._api_key}&libraries=drawing"></script>
-        <script>
-        (function() {{
-            var map = new google.maps.Map(document.getElementById('ttm-colab-map'), {{
-                center: {{ lat: {self._center[0]}, lng: {self._center[1]} }},
-                zoom: {self._zoom},
-                mapTypeId: 'satellite',
-            }});
-
-            var drawingManager = new google.maps.drawing.DrawingManager({{
-                drawingMode: google.maps.drawing.OverlayType.POLYGON,
-                drawingControl: true,
-                drawingControlOptions: {{
-                    position: google.maps.ControlPosition.TOP_CENTER,
-                    drawingModes: ['polygon'],
-                }},
-                polygonOptions: {{
-                    fillColor: '#2196F3',
-                    fillOpacity: 0.25,
-                    strokeWeight: 2,
-                    strokeColor: '#1565C0',
-                    editable: true,
-                }},
-            }});
-            drawingManager.setMap(map);
-
-            google.maps.event.addListener(drawingManager, 'polygoncomplete', function(polygon) {{
-                var path = polygon.getPath();
-                var coords = [];
-                for (var i = 0; i < path.getLength(); i++) {{
-                    var pt = path.getAt(i);
-                    coords.push([pt.lat(), pt.lng()]);
-                }}
-                document.getElementById('ttm-colab-status').innerText =
-                    'Selected ' + coords.length + ' points. Sending to Python...';
-
-                google.colab.kernel.invokeFunction('ttm_set_coords', [JSON.stringify(coords)], {{}});
-            }});
-        }})();
-        </script>
-        """
-        display(HTML(html))
-
-    def _receive_coords(self, coords_json: str) -> None:
-        """Callback to receive coordinates from JavaScript."""
-        coords = json.loads(coords_json)
-        self._polygon_coords = [(c[0], c[1]) for c in coords]
-        print(f"✓ Received {len(self._polygon_coords)} polygon points")
+        display(HTML(self._build_html()))
 
     @property
-    def polygon(self) -> List[Tuple[float, float]]:
-        """The selected polygon coordinates."""
-        return self._polygon_coords
+    def region(self) -> Optional[Any]:
+        """The selected Region, or None if the user hasn't drawn a polygon yet."""
+        return self._region
+
+    def set_region_programmatic(
+        self, coords: List[Tuple[float, float]], name: Optional[str] = None
+    ) -> None:
+        """Set the region programmatically (no map interaction needed)."""
+        from tiles_to_mesh.selector import Region
+
+        self._region = Region.from_coords(coords, name=name)
+        print(
+            f"✓ Region set programmatically: "
+            f"{len(self._region.polygon)} points, "
+            f"~{self._region.area_approx_km2:.3f} km²"
+        )
+
+    # ── internals ─────────────────────────────────────────────────────
+
+    def _receive_coords(self, coords_json: str) -> None:
+        """Callback invoked from JavaScript with the polygon coordinates."""
+        from tiles_to_mesh.selector import Region
+
+        coords = json.loads(coords_json)
+        self._polygon_coords = [(c[0], c[1]) for c in coords]
+        self._region = Region.from_coords(self._polygon_coords)
+        print(
+            f"✓ Region selected: {len(self._polygon_coords)} points, "
+            f"~{self._region.area_approx_km2:.3f} km²"
+        )
+
+    def _build_html(self) -> str:
+        """Return the full HTML string for the map widget.
+
+        The Google Maps JS API is loaded via a ``callback`` parameter so that
+        map initialisation only runs once the library is ready.  The drawing
+        manager lets the user draw exactly one polygon; re-drawing replaces the
+        previous one.  On completion the coordinates are sent to Python through
+        ``google.colab.kernel.invokeFunction``.
+        """
+        return f"""
+<div id="ttm-colab-status"
+     style="padding:8px 12px; font-family:monospace; font-size:13px;
+            background:#f0f4ff; border-radius:6px; margin-bottom:6px;">
+  ⏳ Loading Google Maps…
+</div>
+<div id="ttm-colab-map" style="width:100%; height:{self._height}px; border-radius:6px; overflow:hidden;"></div>
+
+<script>
+// ── helpers ──────────────────────────────────────────────────────────
+function _ttmInitMap() {{
+  var statusEl = document.getElementById('ttm-colab-status');
+  statusEl.innerHTML = '<b>Draw a polygon</b> on the map to select a region.';
+
+  var map = new google.maps.Map(document.getElementById('ttm-colab-map'), {{
+    center: {{ lat: {self._center[0]}, lng: {self._center[1]} }},
+    zoom: {self._zoom},
+    mapTypeId: '{self._map_type}',
+    mapTypeControl: true,
+    streetViewControl: false,
+    fullscreenControl: true,
+  }});
+
+  var drawingManager = new google.maps.drawing.DrawingManager({{
+    drawingMode: google.maps.drawing.OverlayType.POLYGON,
+    drawingControl: true,
+    drawingControlOptions: {{
+      position: google.maps.ControlPosition.TOP_CENTER,
+      drawingModes: ['polygon'],
+    }},
+    polygonOptions: {{
+      fillColor: '#2196F3',
+      fillOpacity: 0.25,
+      strokeWeight: 2,
+      strokeColor: '#1565C0',
+      clickable: true,
+      editable: true,
+      draggable: true,
+    }},
+  }});
+  drawingManager.setMap(map);
+
+  var currentPolygon = null;
+
+  function sendCoords(polygon) {{
+    var path = polygon.getPath();
+    var coords = [];
+    for (var i = 0; i < path.getLength(); i++) {{
+      var pt = path.getAt(i);
+      coords.push([pt.lat(), pt.lng()]);
+    }}
+    statusEl.innerHTML =
+      '<b style="color:#1565C0;">✓ Selected ' + coords.length + ' points.</b> '
+      + 'Edit the polygon or re-draw. Coordinates have been sent to Python.';
+    google.colab.kernel.invokeFunction('ttm_set_coords', [JSON.stringify(coords)], {{}});
+  }}
+
+  google.maps.event.addListener(drawingManager, 'polygoncomplete', function(polygon) {{
+    if (currentPolygon) currentPolygon.setMap(null);
+    currentPolygon = polygon;
+    drawingManager.setDrawingMode(null);
+    sendCoords(polygon);
+
+    google.maps.event.addListener(polygon.getPath(), 'set_at', function() {{ sendCoords(polygon); }});
+    google.maps.event.addListener(polygon.getPath(), 'insert_at', function() {{ sendCoords(polygon); }});
+  }});
+}}
+
+// ── load Google Maps API (with callback) ─────────────────────────────
+(function() {{
+  if (typeof google !== 'undefined' && google.maps) {{
+    _ttmInitMap();
+  }} else {{
+    var s = document.createElement('script');
+    s.src = 'https://maps.googleapis.com/maps/api/js?key={self._api_key}&libraries=drawing&callback=_ttmInitMap';
+    s.async = true;
+    s.defer = true;
+    s.onerror = function() {{
+      document.getElementById('ttm-colab-status').innerHTML =
+        '<b style="color:red;">Failed to load Google Maps API.</b> '
+        + 'Check your API key and that the Maps JavaScript API is enabled.';
+    }};
+    document.head.appendChild(s);
+  }}
+}})();
+</script>
+"""

@@ -124,6 +124,10 @@ class MapSelector:
     Embeds a Google Maps view with polygon drawing tools. Users draw a polygon
     to define their region of interest, and coordinates are captured into Python.
 
+    In Google Colab the widget automatically switches to a Colab-native
+    implementation that uses ``google.colab.kernel.invokeFunction`` for
+    reliable JS ↔ Python communication.
+
     Args:
         api_key: Google Maps JavaScript API key.
         center: Initial map center as (lat, lng). Defaults to (40.748817, -73.985428) (NYC).
@@ -149,6 +153,20 @@ class MapSelector:
         self._width = width
         self._map_type = map_type
         self._region: Optional[Region] = None
+
+        # In Colab, delegate to the Colab-specific selector
+        self._colab_delegate = None
+        if "google.colab" in __import__("sys").modules:
+            from tiles_to_mesh._colab import ColabMapSelector
+            self._colab_delegate = ColabMapSelector(
+                api_key=api_key,
+                center=center,
+                zoom=zoom,
+                height=height,
+                map_type=map_type,
+            )
+            return  # skip ipywidgets setup — not needed in Colab
+
         self._widget_id = f"ttm-map-{uuid.uuid4().hex[:8]}"
         self._output = widgets.Output()
         self._coords_text = widgets.Textarea(
@@ -176,10 +194,16 @@ class MapSelector:
     @property
     def region(self) -> Optional[Region]:
         """The selected region, or None if no selection has been made."""
+        if self._colab_delegate is not None:
+            return self._colab_delegate.region
         return self._region
 
     def show(self) -> None:
         """Display the interactive map selector widget."""
+        if self._colab_delegate is not None:
+            self._colab_delegate.show()
+            return
+
         self._confirm_btn.on_click(self._on_confirm)
         self._clear_btn.on_click(self._on_clear)
 
@@ -357,6 +381,10 @@ class MapSelector:
             coords: List of (lat, lng) tuples defining the polygon.
             name: Optional region name.
         """
+        if self._colab_delegate is not None:
+            self._colab_delegate.set_region_programmatic(coords, name=name)
+            return
+
         self._region = Region.from_coords(coords, name=name)
         self._status.value = (
             f'<b style="color: green;">✓ Region set programmatically: '
