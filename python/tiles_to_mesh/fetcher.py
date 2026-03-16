@@ -223,6 +223,13 @@ def _fetch_mesh_python(
 
     if show_progress:
         print(f"Found {len(tile_urls)} tiles to fetch.")
+        # Show first URL for debugging (mask the API key)
+        if tile_urls:
+            debug_url = tile_urls[0]
+            # Mask the key in the debug output
+            if api_key in debug_url:
+                debug_url = debug_url.replace(api_key, "***")
+            print(f"  First tile URL: {debug_url}")
 
     # Step 3: Fetch tile GLBs
     all_vertices = []
@@ -265,7 +272,13 @@ def _fetch_mesh_python(
             continue
 
     if not all_vertices:
-        raise RuntimeError("Failed to fetch any tile data.")
+        raise RuntimeError(
+            "Failed to fetch any tile data. All tile requests failed.\n"
+            "Common causes:\n"
+            "  - API key does not have the 'Map Tiles API' enabled\n"
+            "  - Malformed tile URLs (check the 'First tile URL' printed above)\n"
+            "  - Region is too small or has no 3D tile coverage"
+        )
 
     # Step 4: Assemble
     vertices = np.vstack(all_vertices)
